@@ -81,3 +81,11 @@ def log_retry_trigger(retry_count: int, max_retries: int, error_summary: str):
     clean_err = error_summary.strip()
     preview = clean_err if len(clean_err) <= 250 else clean_err[:250] + "..."
     print(f"    {YELLOW}Reason:{RESET} {preview}\n", flush=True)
+
+def log_critic_retry(retry_count: int, max_retries: int, issue_summary: str):
+    """Logs when the Model Critic rejects code and triggers a planner revision."""
+    ts = _timestamp()
+    print(f"\n[{ts}] {BOLD}{MAGENTA}[CRITIC RETRY {retry_count}/{max_retries}]{RESET} Critic flagged critical issues. Triggering Planner revision...", flush=True)
+    clean_issue = issue_summary.strip()
+    preview = clean_issue if len(clean_issue) <= 250 else clean_issue[:250] + "..."
+    print(f"    {MAGENTA}Issues:{RESET} {preview}\n", flush=True)

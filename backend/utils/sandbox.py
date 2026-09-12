@@ -5,7 +5,7 @@ import os
 import time
 from backend.utils.logger import log_step_progress, log_step_error
 
-def execute_python_code(code: str, timeout: int = 15) -> tuple[str, str]:
+def execute_python_code(code: str, timeout: int = 120) -> tuple[str, str]:
     """
     Safely executes AI-generated Python code in a temporary, isolated subprocess.
     Includes timeout protection to prevent infinite loops.
