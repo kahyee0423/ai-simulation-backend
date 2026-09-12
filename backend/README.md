@@ -1,10 +1,10 @@
 # AI Simulation Scientist 🧬🤖
 
-An autonomous multi-agent system built with **LangGraph**, **LangSmith**, **Qwen API**, and **FastAPI**. It allows users to simulate any scenario in natural language, writes and executes Python simulation code dynamically in a secure sandbox, and outputs a professional scientific research report.
+An autonomous multi-agent system built with **LangGraph**, **LangSmith**, **Gemini**, and **FastAPI**. It allows users to simulate any scenario in natural language, writes and executes Python simulation code dynamically in a secure sandbox, and outputs a professional scientific research report.
 
 ## Tech Stack
 - **AI Orchestration**: LangGraph, LangSmith
-- **LLM**: Qwen Max (via OpenAI-compatible API)
+- **LLM**: Gemini 3.5 Flash Lite (via OpenAI-compatible API)
 - **Backend**: FastAPI, Python
 - **Simulation Libraries**: NumPy, SciPy, SimPy, NetworkX, Matplotlib
 
