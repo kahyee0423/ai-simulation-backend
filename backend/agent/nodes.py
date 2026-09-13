@@ -1315,69 +1315,69 @@ REPORT STRUCTURE — PRODUCE ALL 19 SECTIONS
 
 # Simulation Experiment Analysis Report
 
-## 1. Executive Summary
+## Executive Summary
 2–3 sentences: what was simulated, the most important finding, and the key caveat.
 
-## 2. Simulation Objective
+## Simulation Objective
 What research question does this simulation investigate?
 What decision is the simulation designed to inform?
 
-## 3. Initial Conditions
+## Initial Conditions
 List starting state values.
 For each: label as [USER_PROVIDED], [DERIVED], or [MODEL_ASSUMPTION].
 Note any discrepancies between the declared initial conditions and what appears in the code.
 
-## 4. Entities and State Variables
+## Entities and State Variables
 What entities exist in the simulation?
 What state variables track their condition?
 How do state variables evolve?
 
-## 5. Model Parameters
+## Model Parameters
 Table: parameter | value | provenance | effect on simulation.
 Every parameter must have a provenance label.
 Do NOT describe MODEL_ASSUMPTION parameters as "typical" or "market" values.
 
-## 6. Assumptions and Parameter Provenance
+## Assumptions and Parameter Provenance
 Explicit table of all MODEL_ASSUMPTION parameters.
 For each: what value was chosen, why, and what effect it has on results.
 Flag any assumption that significantly constrains the outcome.
 
-## 7. Simulation Methodology
+## Simulation Methodology
 Accurately describe what the code actually implements.
 Do NOT call it agent-based unless the code contains observation→policy→action agents.
 If it is a rule-based stochastic simulation, say so.
 Explain: state transitions, decision rules, randomness sources, time evolution.
 
-## 8. Decision Policies / Agent Behaviors
+## Decision Policies / Agent Behaviors
 What decisions are made during the simulation?
 What triggers each decision? (Give the actual threshold or condition from the code.)
 Label decision outcomes as POLICY_ENFORCED where applicable.
 Example: "When student/lecturer ratio > [threshold] [MODEL_ASSUMPTION], the
 administration hires [N] lecturers. This is a POLICY_ENFORCED outcome."
 
-## 9. Simulation Dynamics
+## Simulation Dynamics
 How did the system evolve over the simulation horizon?
 What feedback loops exist?
 What events typically occurred in what order?
 Only discuss dynamics that are actually represented in the code.
 
-## 10. Event Timeline
+## Event Timeline
 Summarise the most significant events from the events log.
 If no event log was produced, note this as a limitation.
 Format: Time | Actor | Event | Reason
 
-## 11. Statistical Results
+## Statistical Results
 Present ALL statistics from the pre-computed evidence section.
 Use tables. Do not invent new figures.
 Include: mean, median, std, P10, P25, P75, P90 for all outcome metrics.
 
-## 12. Constraint / Failure Analysis
+## Constraint / Failure Analysis
 Present constraint violation probabilities from the pre-computed stats.
 P(constraint violated) for each tracked constraint.
 P(budget < 0), P(ratio > threshold), P(utilization > limit), etc.
 If constraint violations were not tracked, note this as a limitation.
 
-## 13. Scenario Comparison
+## Scenario Comparison
 If multiple strategies or scenarios were simulated:
 - Present the comparison table from pre-computed stats.
 - Verify that scenarios started from identical initial conditions.
@@ -1385,20 +1385,20 @@ If multiple strategies or scenarios were simulated:
 If only one scenario was simulated, note this as a limitation and
 explain what alternative scenarios would be informative.
 
-## 14. Sensitivity and Uncertainty Analysis
+## Sensitivity and Uncertainty Analysis
 What parameters most affect the outcome?
 If sensitivity analysis was not performed:
 - Identify the top 3 parameters that would most affect results if changed.
 - Recommend what sensitivity analysis should be run.
 Note this is speculative unless the simulation actually varied parameters.
 
-## 15. Key Findings
+## Key Findings
 For each finding:
 - **Observed [SIMULATION_OUTPUT]:** What the simulation directly produced (with numbers).
 - **Interpretation [AI_INTERPRETATION]:** What that observation means.
 - **Caveat:** What the finding depends on (assumptions, control policies, etc.).
 
-## 16. Decision Analysis
+## Decision Analysis
 For each available decision or strategy:
 - Benefits (under the modeled assumptions)
 - Risks and downside outcomes
@@ -1406,7 +1406,7 @@ For each available decision or strategy:
 - Conditions under which it is the better choice
 If no universally optimal strategy exists, explain why with evidence.
 
-## 17. Limitations and Unmodeled Factors
+## Limitations and Unmodeled Factors
 Explicitly list:
 - Variables not modeled
 - Simplified assumptions
@@ -1415,13 +1415,13 @@ Explicitly list:
 - Methodology limitations (e.g. rule-based rather than genuinely adaptive)
 - Missing sensitivity / scenario analysis
 
-## 18. Scientific Conclusion
+## Scientific Conclusion
 What does the simulation actually demonstrate?
 Use language: "Under the assumptions represented in the simulation..."
 NOT: "This will happen in reality."
 Distinguish: simulation evidence vs real-world prediction.
 
-## 19. Recommendations
+## Recommendations
 Each recommendation must:
 - State the assumption(s) it depends on.
 - State what evidence supports it.
