@@ -9,20 +9,29 @@ def execute_python_code(code: str, timeout: int = 120) -> tuple[str, str]:
     """
     Safely executes AI-generated Python code in a temporary, isolated subprocess.
     Includes timeout protection to prevent infinite loops.
+    Ensures UTF-8 encoding for both script writing and subprocess I/O on Windows.
     """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(code)
-        temp_file_path = f.name
-
-    log_step_progress(f"Sandbox script created at: {temp_file_path}")
-    log_step_progress(f"Executing with Python interpreter (timeout={timeout}s)...")
+    temp_file_path = None
     start_time = time.time()
 
     try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8', errors='replace') as f:
+            f.write(code)
+            temp_file_path = f.name
+
+        log_step_progress(f"Sandbox script created at: {temp_file_path}")
+        log_step_progress(f"Executing with Python interpreter (timeout={timeout}s)...")
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
+
         result = subprocess.run(
             [sys.executable, temp_file_path],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
+            env=child_env,
             timeout=timeout
         )
         elapsed = time.time() - start_time
@@ -43,6 +52,9 @@ def execute_python_code(code: str, timeout: int = 120) -> tuple[str, str]:
         log_step_error("EXECUTOR", f"Exception during sandbox execution: {str(e)}")
         return "", err
     finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-            log_step_progress("Cleaned up sandbox temporary script file")
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                log_step_progress("Cleaned up sandbox temporary script file")
+            except Exception:
+                pass

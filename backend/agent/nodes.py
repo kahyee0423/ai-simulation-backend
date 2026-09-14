@@ -13,7 +13,6 @@ from backend.utils.logger import (
     log_step_progress,
     log_step_success,
     log_step_warning,
-    log_step_error,
     log_retry_trigger,
 )
 
@@ -24,9 +23,47 @@ llm = ChatOpenAI(
     temperature=0.2
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPER UTILITIES
-# ──────────────────────────────────────────────────────────────────────────────
+_EMPTY_OUTPUT_PHRASES = (
+    "model output must contain either output text or tool calls",
+    "candidate content was empty",
+    "finish_reason: safety",
+    "response was filtered",
+)
+
+def llm_invoke_safe(messages: list, max_retries: int = 2, node_name: str = "LLM"):
+    """
+    Safe wrapper around llm.invoke() that retries on empty-content responses.
+    The Gemini/OpenAI API can return an empty response when the model output
+    is blocked by a safety filter or when the model fails to generate content.
+    This wrapper catches those cases and retries up to `max_retries` times.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 2):  # attempts: 1 .. max_retries+1
+        try:
+            response = llm.invoke(messages)
+            # Some API wrappers return a response object with empty content
+            # instead of raising an exception.
+            if not getattr(response, "content", None):
+                raise ValueError(
+                    "model output error: model output must contain either "
+                    "output text or tool calls, these cannot both be empty"
+                )
+            return response
+        except Exception as exc:
+            err_lower = str(exc).lower()
+            is_empty_output = any(p in err_lower for p in _EMPTY_OUTPUT_PHRASES)
+            if is_empty_output and attempt <= max_retries:
+                log_step_warning(
+                    node_name,
+                    f"Empty/blocked model output on attempt {attempt}/{max_retries + 1}. "
+                    f"Retrying... ({exc})"
+                )
+                last_exc = exc
+                time.sleep(1.5 * attempt)  # brief back-off
+                continue
+            raise  # non-retryable error, or retries exhausted
+    # Should not reach here, but satisfy linters
+    raise last_exc  # type: ignore[misc]
 
 def _extract_code_block(content: str) -> str:
     """Extract the first Python code block from an LLM response."""
@@ -85,6 +122,62 @@ def _get_num_runs(spec_str: str) -> int:
         return 500
 
 
+def _detect_language(text: str) -> str:
+    """
+    Detect the primary natural language of a text prompt.
+    Supports Asian scripts, Cyrillic, Arabic, and major Western languages.
+    """
+    if not text or not text.strip():
+        return "English"
+
+    chinese_count = len(re.findall(r'[\u4e00-\u9fff]', text))
+    japanese_kana = len(re.findall(r'[\u3040-\u30ff]', text))
+    korean_hangul = len(re.findall(r'[\uac00-\ud7af]', text))
+    cyrillic_count = len(re.findall(r'[\u0400-\u04ff]', text))
+    arabic_count = len(re.findall(r'[\u0600-\u06ff]', text))
+
+    if chinese_count >= 2 and chinese_count >= japanese_kana:
+        return "Chinese"
+    if japanese_kana >= 2:
+        return "Japanese"
+    if korean_hangul >= 2:
+        return "Korean"
+    if cyrillic_count >= 3:
+        return "Russian"
+    if arabic_count >= 3:
+        return "Arabic"
+
+    lower = text.lower()
+    words = set(re.findall(r'\b[a-zà-ÿ]+\b', lower))
+
+    spanish_markers = {"el", "la", "los", "las", "un", "una", "de", "en", "que", "por", "para", "con", "simular", "simulación", "drones", "entrega", "ciudad", "modelo", "es", "son"}
+    french_markers = {"le", "la", "les", "un", "une", "des", "du", "de", "en", "que", "pour", "avec", "simuler", "simulation", "livraison", "ville", "est", "sont"}
+    german_markers = {"der", "die", "das", "ein", "eine", "und", "in", "den", "von", "zu", "mit", "simulieren", "simulation", "lieferung", "stadt", "ist", "sind"}
+    portuguese_markers = {"o", "a", "os", "as", "um", "uma", "em", "para", "com", "não", "simular", "simulação", "entrega", "são"}
+    italian_markers = {"il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "in", "per", "con", "simulare", "simulazione", "città"}
+
+    if len(words & spanish_markers) >= 2:
+        return "Spanish"
+    if len(words & french_markers) >= 2:
+        return "French"
+    if len(words & german_markers) >= 2:
+        return "German"
+    if len(words & portuguese_markers) >= 2:
+        return "Portuguese"
+    if len(words & italian_markers) >= 2:
+        return "Italian"
+
+    return "English"
+
+
+def _get_language(state: SimulationState) -> str:
+    """Retrieve target language from state or auto-detect from user_prompt."""
+    lang = state.get("language")
+    if lang and lang.lower() != "auto":
+        return lang
+    return _detect_language(state.get("user_prompt", ""))
+
+
 def _strip_json_fences(raw: str) -> str:
     """Strip markdown code fences from a JSON response."""
     s = raw.strip()
@@ -96,31 +189,39 @@ def _strip_json_fences(raw: str) -> str:
     return s
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 1 — SCENARIO PARSER
-# ──────────────────────────────────────────────────────────────────────────────
-
-def scenario_parser_node(state: SimulationState) -> SimulationState:
+def scenario_parser_node(state: SimulationState) -> SimulationState: #node 1a
     """
     Scenario Parser: Converts the natural-language user prompt into a
     structured JSON simulation specification with provenance labels.
     """
+    target_lang = _get_language(state)
     log_step_start(
         "SCENARIO PARSER",
-        f"Extracting structured simulation specification using '{settings.MODEL_NAME}'..."
+        f"Extracting structured simulation specification [{target_lang}] using '{settings.MODEL_NAME}'..."
     )
+
+    lang_instruction = f"""
+LANGUAGE REQUIREMENT (MANDATORY — HIGHEST PRIORITY):
+The user scenario is written in '{target_lang}'.
+You MUST write all natural-language string values in your JSON output (domain, objective, methodology_note, hypothesis names and descriptions, entity names and objectives, actions, outcomes, constraint names and descriptions, notes, and assumption lists) in the EXACT SAME LANGUAGE as the user scenario ({target_lang}).
+JSON schema keys (such as "domain", "objective", "methodology_hint", "competing_hypotheses", "entities", "initial_state", "parameters", "actions", "outcomes", "constraints", "stochastic_variables", "provenance", etc.) and enum tokens (such as "USER_PROVIDED", "MODEL_ASSUMPTION", "OBSERVED", "DERIVED", "AI_INFERENCE", "agent", "environment", "resource", "process") MUST REMAIN EXACTLY IN ENGLISH as defined in the schema for program compatibility.
+"""
 
     prompt = f"""
 You are a Simulation Scenario Analyst for a Universal AI Simulation Engine.
 
 Your task is to read the user's natural-language scenario and extract a
 structured simulation specification as a JSON object.
+{lang_instruction}
 
-CRITICAL: Classify every parameter with a provenance label:
-  USER_PROVIDED   — the user explicitly stated this value
-  DERIVED         — calculated from a USER_PROVIDED value
+CRITICAL: Classify every parameter with a provenance label using the FULL taxonomy:
+  USER_PROVIDED    — the user explicitly stated this value
+  OBSERVED         — directly measured or logged from a data source
+  DERIVED          — calculated mathematically from USER_PROVIDED or OBSERVED values
   MODEL_ASSUMPTION — the simulation will need to invent this; not stated by the user
-  UNKNOWN         — unclear; must be flagged as a gap
+  SIMULATED        — produced as output by the simulation itself
+  AI_INFERENCE     — inferred by the AI from context, not explicitly stated
+  UNKNOWN          — unclear; must be flagged as a gap
 
 USER SCENARIO:
 {state.get('user_prompt', '')}
@@ -133,14 +234,17 @@ Respond ONLY with a valid JSON object with this exact schema:
   "num_runs": <int>,
   "methodology_hint": "<one of: deterministic_simulation | stochastic_simulation | monte_carlo | discrete_event_simulation | system_dynamics | agent_based_simulation | game_theoretic | hybrid>",
   "methodology_note": "<why this methodology was chosen>",
+  "competing_hypotheses": [
+    {{"id": "H1", "name": "<short name>", "description": "<one sentence causal story>"}}
+  ],
   "entities": [
     {{"name": "<str>", "type": "agent|environment|resource|process", "objective": "<str or null>"}}
   ],
   "initial_state": {{
-    "<param_name>": {{"value": <value_or_null>, "provenance": "USER_PROVIDED|MODEL_ASSUMPTION|DERIVED|UNKNOWN", "note": "<optional note>"}}
+    "<param_name>": {{"value": <value_or_null>, "provenance": "USER_PROVIDED|OBSERVED|MODEL_ASSUMPTION|DERIVED|AI_INFERENCE|UNKNOWN", "note": "<optional note>"}}
   }},
   "parameters": {{
-    "<param_name>": {{"value": <value_or_null>, "provenance": "USER_PROVIDED|MODEL_ASSUMPTION|DERIVED|UNKNOWN", "note": "<optional note>"}}
+    "<param_name>": {{"value": <value_or_null>, "provenance": "USER_PROVIDED|OBSERVED|MODEL_ASSUMPTION|DERIVED|AI_INFERENCE|UNKNOWN", "note": "<optional note>"}}
   }},
   "actions": {{
     "<entity_name>": ["<action1>", "<action2>"]
@@ -159,12 +263,15 @@ Respond ONLY with a valid JSON object with this exact schema:
 
 IMPORTANT RULES:
 - Only mark as USER_PROVIDED if the user explicitly stated the value.
+- Use AI_INFERENCE for things the AI deduces from context (e.g. 'employee asleep implies manual action unlikely').
 - If the user says \"enrollment will increase 20% next year\", classify that as a
   one_time_assumption, NOT a recurring assumption.
 - Never invent \"empirical\" values — label everything the simulation invents as MODEL_ASSUMPTION.
 - methodology_hint must reflect what the code will ACTUALLY implement, not what sounds impressive.
   Do NOT choose agent_based_simulation unless the scenario genuinely requires autonomous agents
   with their own state, observations, objectives, and decision policies.
+- competing_hypotheses: list ALL plausible causal explanations for the scenario outcome,
+  not just the most likely one. The hypothesis updater will rank them.
 """
 
     messages = [
@@ -180,7 +287,7 @@ IMPORTANT RULES:
 
     log_step_progress("Sending scenario to LLM for structured extraction...")
     start_time = time.time()
-    response = llm.invoke(messages)
+    response = llm_invoke_safe(messages, node_name="PARSER")
     elapsed = time.time() - start_time
 
     raw = response.content or ""
@@ -208,18 +315,186 @@ IMPORTANT RULES:
         )
         spec_str = raw
 
-    return {"simulation_spec": spec_str}
+    return {"simulation_spec": spec_str, "language": target_lang}
 
+def hypothesis_updater_node(state: SimulationState) -> SimulationState: #node 1b (hypothesis updater - bayesian belief table)
+    """
+    Hypothesis Updater: Implements Bayesian hypothesis updating.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 2 — PLANNER (Simulation Architect)
-# ──────────────────────────────────────────────────────────────────────────────
+    Takes the parsed simulation spec and:
+    1. Identifies all competing hypotheses for the scenario outcome.
+    2. Assigns prior probabilities to each (labelled MODEL_ASSUMPTION).
+    3. For each piece of USER_PROVIDED or AI_INFERENCE evidence,
+       applies a likelihood ratio update to the hypothesis weights.
+    4. Normalizes posterior weights into probabilities.
+    5. Returns a ranked table of prior vs. posterior beliefs plus the
+       dominant hypothesis and evidence log.
 
-def planner_node(state: SimulationState) -> SimulationState:
+    The planner reads this to focus simulation on the right causal branch,
+    while still acknowledging secondary hypotheses and their probabilities.
+    """
+    target_lang = _get_language(state)
+    log_step_start(
+        "HYPOTHESIS UPDATER",
+        f"Performing Bayesian hypothesis updating [{target_lang}] using '{settings.MODEL_NAME}'..."
+    )
+
+    spec = state.get("simulation_spec", "")
+
+    lang_instruction = f"""
+LANGUAGE REQUIREMENT (MANDATORY — HIGHEST PRIORITY):
+The user scenario is written in '{target_lang}'.
+ALL textual content in your JSON response (hypothesis "name", "description", "exclusion_reason", "evidence", "justification", "dominant_hypothesis_name", "simulation_focus", "multi_branch_reason") MUST BE WRITTEN IN THE EXACT SAME LANGUAGE as the user scenario ({target_lang}).
+JSON keys and enum status values ("dominant", "plausible", "low_probability", "excluded", "USER_PROVIDED", "OBSERVED", "AI_INFERENCE", "MODEL_ASSUMPTION", "DERIVED") MUST REMAIN in English for program compatibility.
+"""
+
+    prompt = f"""
+You are the Hypothesis Scientist of a Universal AI Simulation Engine.
+
+Your task is to perform Bayesian hypothesis updating on the user's scenario.
+{lang_instruction}
+
+--------------------------------------------------
+SIMULATION SPECIFICATION
+--------------------------------------------------
+{spec}
+
+--------------------------------------------------
+INSTRUCTIONS
+--------------------------------------------------
+
+STEP 1 — ENUMERATE HYPOTHESES
+List ALL plausible causal explanations for the scenario's main outcome.
+Use the competing_hypotheses from the spec if provided; add any you think are missing.
+Each hypothesis must have a short name and a one-sentence causal story.
+
+STEP 2 — ASSIGN PRIORS
+Assign a prior probability to each hypothesis BEFORE considering any evidence.
+These are your base rates before any evidence is applied.
+Label all priors as "MODEL_ASSUMPTION" — you are inventing these.
+Priors must sum to 1.0.
+
+STEP 3 — EVIDENCE LOG
+List every piece of evidence from the spec's initial_state and parameters
+that is USER_PROVIDED, OBSERVED, or AI_INFERENCE.
+For each evidence item, write:
+  - The evidence statement
+  - Its provenance label
+  - For EACH hypothesis: a likelihood ratio (> 1 = makes hypothesis more likely,
+    < 1 = makes hypothesis less likely, 1.0 = neutral)
+  - Justification for each likelihood ratio
+
+STEP 4 — COMPUTE POSTERIORS
+For each hypothesis, multiply its prior by ALL likelihood ratios from Step 3.
+Normalize so posteriors sum to 1.0.
+Show the full computation.
+
+STEP 5 — RANK AND CONCLUDE
+Rank hypotheses by posterior probability.
+Identify the dominant hypothesis (highest posterior).
+Note which hypotheses are "still plausible" (posterior > 5%) vs "low probability" (< 5%).
+IMPORTANT: A hypothesis with low posterior is NOT the same as "ruled out".
+           Only say a hypothesis is "excluded" if its posterior is effectively 0
+           AND there is a hard logical impossibility (not just low probability).
+
+PROVENANCE & CALIBRATION RULES:
+  - Prior probabilities: always MODEL_ASSUMPTION (subjective base rates)
+  - Likelihood ratios: MODEL_ASSUMPTION (uncalibrated model-assigned weights, not empirical constants)
+  - Posterior probabilities: DERIVED (mathematically calculated from priors × likelihoods)
+  - CRITICAL SCIENTIFIC DISTINCTION: Posteriors are model-derived belief weights under specified likelihood assumptions, NOT real-world empirical occurrence probabilities.
+  - Evidence items: match the provenance from the spec
+
+Respond ONLY with a valid JSON object:
+{{
+  "hypotheses": [
+    {{
+      "id": "<H1>",
+      "name": "<short name>",
+      "description": "<one-sentence causal story>",
+      "prior": <float 0-1>,
+      "prior_provenance": "MODEL_ASSUMPTION",
+      "posterior": <float 0-1>,
+      "posterior_provenance": "DERIVED",
+      "posterior_rank": <int starting from 1>,
+      "status": "dominant | plausible | low_probability | excluded",
+      "exclusion_reason": "<only if status=excluded: the hard logical impossibility>"
+    }}
+  ],
+  "evidence_log": [
+    {{
+      "evidence": "<statement>",
+      "provenance": "USER_PROVIDED | OBSERVED | AI_INFERENCE",
+      "likelihood_ratios": {{
+        "<hypothesis_id>": <float>,
+        ...
+      }},
+      "justification": "<why these ratios>"
+    }}
+  ],
+  "dominant_hypothesis": "<hypothesis id>",
+  "dominant_hypothesis_name": "<short name>",
+  "dominant_posterior": <float>,
+  "secondary_hypotheses": ["<list of plausible hypothesis ids>"],
+  "excluded_hypotheses": ["<list of truly excluded hypothesis ids>"],
+  "simulation_focus": "<one sentence: what causal chain the simulation should primarily test>",
+  "multi_branch_required": <true|false>,
+  "multi_branch_reason": "<if true: why the simulation must model multiple branches>"
+}}
+"""
+
+    messages = [
+        SystemMessage(
+            content=(
+                "You are an expert probabilistic reasoning scientist. "
+                "You apply Bayesian inference to identify the most supported "
+                "hypothesis from a set of competing explanations. "
+                "You are rigorous about distinguishing 'low probability' from 'ruled out'. "
+                "Respond only with valid JSON."
+            )
+        ),
+        HumanMessage(content=prompt)
+    ]
+
+    log_step_progress("Sending spec to LLM for Bayesian hypothesis updating...")
+    start_time = time.time()
+    response = llm_invoke_safe(messages, node_name="HYPOTHESIS_UPDATER")
+    elapsed = time.time() - start_time
+
+    raw = response.content or ""
+    analysis_str = _strip_json_fences(raw)
+
+    try:
+        analysis = json.loads(analysis_str)
+        hypotheses = analysis.get("hypotheses", [])
+        dominant = analysis.get("dominant_hypothesis_name", "unknown")
+        dominant_p = analysis.get("dominant_posterior", 0.0)
+        secondary = analysis.get("secondary_hypotheses", [])
+        excluded = analysis.get("excluded_hypotheses", [])
+        multi = analysis.get("multi_branch_required", False)
+        evidence_count = len(analysis.get("evidence_log", []))
+        log_step_success(
+            "HYPOTHESIS UPDATER",
+            elapsed,
+            f"Bayesian update complete — {len(hypotheses)} hypotheses, "
+            f"dominant='{dominant}' ({dominant_p:.1%}), "
+            f"plausible secondary={len(secondary)}, excluded={len(excluded)}, "
+            f"evidence_items={evidence_count}, multi_branch={multi}"
+        )
+    except json.JSONDecodeError:
+        log_step_warning(
+            "HYPOTHESIS UPDATER",
+            f"Could not parse hypothesis analysis as JSON — storing raw ({elapsed:.2f}s)"
+        )
+        analysis_str = raw
+
+    return {"hypothesis_analysis": analysis_str, "language": target_lang}
+
+def planner_node(state: SimulationState) -> SimulationState: #node 2
     """
     Planner (Simulation Architect): Generates a rigorous, scientifically honest
     simulation script guided by the specification and provenance rules.
     """
+    target_lang = _get_language(state)
     retry_count = state.get("retry_count", 0)
     critic_retry_count = state.get("critic_retry_count", 0)
     has_exec_error = bool(state.get("execution_error"))
@@ -228,22 +503,24 @@ def planner_node(state: SimulationState) -> SimulationState:
     if has_exec_error:
         log_step_start(
             "PLANNER",
-            f"Fixing execution error — regeneration attempt {retry_count + 1} "
+            f"Fixing execution error [{target_lang}] — regeneration attempt {retry_count + 1} "
             f"using '{settings.MODEL_NAME}'..."
         )
     elif has_critic_issue:
         log_step_start(
             "PLANNER",
-            f"Addressing critic feedback — revision {critic_retry_count} "
+            f"Addressing critic feedback [{target_lang}] — revision {critic_retry_count} "
             f"using '{settings.MODEL_NAME}'..."
         )
     else:
         log_step_start(
             "PLANNER",
-            f"Generating simulation script (Simulation Architect) using '{settings.MODEL_NAME}'..."
+            f"Generating simulation script (Simulation Architect) [{target_lang}] using '{settings.MODEL_NAME}'..."
         )
 
     spec = state.get("simulation_spec", "")
+    hypothesis_analysis = state.get("hypothesis_analysis", "")
+
     spec_block = f"""
 --------------------------------------------------
 SIMULATION SPECIFICATION
@@ -251,6 +528,14 @@ SIMULATION SPECIFICATION
 --------------------------------------------------
 {spec}
 """ if spec else ""
+
+    hypothesis_block = f"""
+--------------------------------------------------
+BAYESIAN HYPOTHESIS ANALYSIS
+(use this to focus your simulation on the right causal branch)
+--------------------------------------------------
+{hypothesis_analysis}
+""" if hypothesis_analysis else ""
 
     error_context = ""
     if has_exec_error:
@@ -272,15 +557,27 @@ MODEL CRITIC FEEDBACK — address ALL points listed
 
     num_runs = _get_num_runs(spec)
 
+    lang_instruction = f"""
+═══════════════════════════════════════════════════
+LANGUAGE REQUIREMENT (MANDATORY — HIGHEST PRIORITY)
+═══════════════════════════════════════════════════
+
+The user scenario is written in '{target_lang}'.
+1. Architectural plan reasoning text, explanations, code docstrings, and code comments MUST be written in {target_lang}.
+2. Terminal prints: ALL `print(...)` statements and console outputs generated by the Python code MUST be written in {target_lang} (e.g. print("=== ... ==="), progress prints, scenario conclusions). This ensures that when the code executes, the terminal output (stdout) shown to the user is in {target_lang}!
+3. In SIMULATION_RESULTS_JSON: Keep keys in English, but write all human-readable string values (such as methodology_note, assumption justifications, event descriptions, decision descriptions, termination_reason) in {target_lang}.
+"""
+
     prompt = f"""
 You are the Simulation Architect of a Universal AI Simulation Engine.
 
 Your task is to transform the user's scenario into a rigorous, executable,
 scientifically honest Python simulation.
+{lang_instruction}
 
 USER SCENARIO:
 \"{state.get('user_prompt', '')}\"
-{spec_block}{error_context}{critic_context}
+{spec_block}{hypothesis_block}{error_context}{critic_context}
 
 ═══════════════════════════════════════════════════
 PART 1 — BEFORE WRITING CODE: IDENTIFY THE MODEL
@@ -307,6 +604,26 @@ PART 2 — METHODOLOGY SELECTION RULES
 
 Choose the methodology that matches what the code ACTUALLY implements.
 Do NOT choose a methodology because it sounds more sophisticated.
+
+METHODOLOGY SELECTION TABLE — match your problem type to the right methodology:
+
+  Problem Type                           | Best Methodology
+  --------------------------------------|---------------------------------
+  Cyber attack / fraud probability       | monte_carlo
+  Investment portfolio / financial risk  | monte_carlo
+  Epidemic / disease spread              | system_dynamics OR agent_based_simulation
+  Population dynamics / ecology          | system_dynamics
+  Chemical / physical system             | system_dynamics
+  Supply chain / logistics disruption    | discrete_event_simulation
+  Queueing / server / call-center        | discrete_event_simulation
+  Manufacturing / factory floor          | discrete_event_simulation
+  Multiple autonomous attackers / agents | agent_based_simulation
+  Traffic / pedestrian movement          | agent_based_simulation
+  Market competition with strategies     | game_theoretic
+  Any combination of the above           | hybrid
+
+You MUST justify your methodology choice in methodology_note by referencing
+the matching row from this table.
 
 VALID METHODOLOGIES:
   deterministic_simulation   — no randomness; same result every run
@@ -435,10 +752,10 @@ Run {num_runs} independent simulation trials.
 For each trial, record per-trial outcomes in lists.
 Include a fixed random seed: np.random.seed(42)
 
-Track constraint violations per trial:
+Track constraint application per trial:
 ```python
-constraint_violations = {{
-    "<constraint_name>": []  # list of violation events per run
+constraint_application = {{
+    "<constraint_name>_constraint_blocked_flag": []  # 1 if branch was blocked by constraint this run, 0 otherwise
 }}
 ```
 
@@ -453,8 +770,8 @@ SIMULATION_RESULTS_JSON:
   "metadata": {{
     "runs": <int>,
     "seed": <int>,
-    "methodology": "<chosen methodology — must match actual implementation>",
-    "methodology_note": "<one sentence description of what the code actually does>",
+    "methodology": "<chosen methodology>",
+    "methodology_note": "<one sentence description>",
     "time_horizon": <int>,
     "time_unit": "<str>"
   }},
@@ -473,14 +790,14 @@ SIMULATION_RESULTS_JSON:
     }}
   ],
   "outcomes": {{
-    "<metric_name>": [<list of per-run values>]
+    "<metric_name>_success_flag": [<list of per-run 0/1 values>]
   }},
   "summary": {{
-    "<metric>_mean": <float>,
-    "<metric>_std": <float>
+    "<metric>_observed_rate": <float, computed from flag array>,
+    "<metric>_std": <float, np.std(flag_array, ddof=1)>
   }},
-  "constraint_violations": {{
-    "<constraint_name>": [<list of violation counts per run>]
+  "constraint_application": {{
+    "<constraint_name>_constraint_blocked_flag": [<list of per-run 0/1 values>]
   }},
   "events": [
     {{"time": <int>, "actor": "<str>", "event": "<str>", "reason": {{}}}}
@@ -495,6 +812,11 @@ SIMULATION_RESULTS_JSON:
   "termination_reason": "<str>"
 }}
 
+STATISTICS RULE: Every <metric>_std value in the summary block MUST be computed
+from the actual per-run array using np.std(array, ddof=1).
+DO NOT report std of a scalar (e.g. dominant_branch_observed_rate is a single float;
+its std is meaningless). Only report std for values that vary across runs.
+
 ═══════════════════════════════════════════════════
 PART 9 — CODE QUALITY REQUIREMENTS
 ═══════════════════════════════════════════════════
@@ -507,8 +829,253 @@ PART 9 — CODE QUALITY REQUIREMENTS
 6. Also print human-readable output BEFORE the JSON block.
 7. Libraries available: numpy, scipy, simpy, networkx, matplotlib,
    random, math, pandas, statistics
+8. STANDARD DEVIATION RULE:
+   Compute std only from per-run arrays, never from scalars.
+   Correct:  h1_std = np.std(branch_h1_success_flags, ddof=1)
+   Correct:  h2_std = np.std(branch_h2_success_flags, ddof=1)
+   Forbidden: dominant_rate_std = np.std(dominant_observed_rate)  # scalar has no std!
+   The human-readable output section may then print:
+     "H1: {{h1_observed_rate:.1%}} ± {{h1_std:.1%}}"
+   but ONLY when h1_std is computed from the actual flag array.
+9. TERMINOLOGY RULES:
+   - Use "MODELED LEADING SCENARIO" instead of "DETERMINATION" or "Most likely attack scenario".
+   - Use "most frequently successful modeled pathway" instead of "validated pathway" or "confirmed pathway".
 
 The code must be syntactically valid, complete, and executable without modification.
+
+═══════════════════════════════════════════════════
+PART 10 — PROBABILITY METRIC SEPARATION (CRITICAL)
+═══════════════════════════════════════════════════
+
+NEVER mix model-estimated probability, simulated outcome, and likelihood score
+into a single variable. These are three distinct concepts:
+
+  p_model_<event>        — your assumed probability of the event occurring
+                           (MODEL_ASSUMPTION; a fixed input to the simulation)
+  <event>_success_flag   — 1/0 per-trial binary outcome (SIMULATED per run)
+  <event>_observed_rate  — actual Monte Carlo frequency: successes / total_runs
+                           (DERIVED; computed AFTER all runs complete)
+
+NAMING RULE — FORBIDDEN variable names for 0/1 outcomes:
+  BAD:  probability_of_remote_exploitation  = [1.0, 0.0, 1.0, ...]  ← these are flags!
+  BAD:  remote_exploitation_likelihood      = [1.0, 0.0, 1.0, ...]  ← these are flags!
+  GOOD: remote_exploitation_success_flag    = [1,   0,   1,   ...]  ← correct
+  GOOD: remote_exploitation_observed_rate   = 0.84                  ← scalar after all runs
+
+The word "probability" or "likelihood" in a variable name MUST refer to
+a scalar float in [0, 1] that is a model input or a post-run aggregate.
+It MUST NOT refer to a per-trial binary list.
+
+FORBIDDEN PATTERN:
+  # BAD — mixes assumed prob with simulated outcome
+  likelihood = 1.0 if success else effective_prob
+
+CORRECT PATTERN:
+  # GOOD — all three are computed separately
+  p_model_exploit = 0.85                                   # MODEL_ASSUMPTION scalar
+  exploit_success_flag = int(np.random.random() < p_model_exploit)  # per-trial 0/1
+  # ... after all runs:
+  exploit_observed_rate = sum(exploit_flags) / num_runs   # DERIVED scalar
+
+In the SIMULATION_RESULTS_JSON, report ALL THREE under separate keys:
+  "outcomes": {{
+    "exploit_success_flag": [...per-run 0/1 list...],     # stochastic outcome
+    "exploit_observed_rate": <scalar float 0-1>            # final empirical rate
+  }},
+  "parameters": {{
+    "p_model_exploit": {{"value": 0.85, "provenance": "MODEL_ASSUMPTION"}}
+  }}
+
+The analyst report must say:
+  "Observed Monte Carlo success rate: X% (k/n runs), with a Bernoulli std dev of Y across trials (SE = ±Z%)"
+  NOT "Attack vector likelihood: Z%" and NEVER "X% ± Y% confidence".
+
+═══════════════════════════════════════════════════
+PART 10.5 — PARAMETER SENSITIVITY SWEEP (SCIENTIFIC BEST PRACTICE)
+═══════════════════════════════════════════════════
+
+When the simulation outcome is strongly driven by an influential MODEL_ASSUMPTION parameter
+(e.g., boundary defensiveness, threshold, exploit rate, adoption fraction):
+Include a parameter sensitivity sweep in the simulation script.
+Sweep 4 to 6 values across a plausible range (e.g. [0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+with a fast sub-sample of runs (e.g. 100-200 runs per point) and output in SIMULATION_RESULTS_JSON:
+  "sensitivity_sweep": {{
+    "parameter": "<name_of_param>",
+    "points": [
+      {{"value": 0.50, "rate": 0.21}},
+      {{"value": 0.60, "rate": 0.27}},
+      {{"value": 0.70, "rate": 0.34}},
+      {{"value": 0.80, "rate": 0.39}},
+      {{"value": 0.90, "rate": 0.44}},
+      {{"value": 1.00, "rate": 0.48}}
+    ]
+  }}
+This provides empirical sensitivity gradients proving whether the modeled outcome responds monotonically to key assumptions.
+
+═══════════════════════════════════════════════════
+PART 11 — MULTI-BRANCH CAUSAL MODELING
+═══════════════════════════════════════════════════
+
+If the Bayesian Hypothesis Analysis provided above identifies multiple PLAUSIBLE
+hypotheses (any hypothesis with posterior > 5%), your simulation MUST model
+EACH plausible hypothesis as a separate causal branch.
+
+For each branch:
+  1. Implement its own causal chain (sequence of conditional events)
+  2. Give each step its own p_model probability (labelled MODEL_ASSUMPTION)
+  3. Give each step its own stochastic noise (timing jitter, detection prob, etc.)
+  4. Track per-branch success/failure independently
+  5. Include branch-specific constraint checks
+
+TIME HORIZON RULE:
+  Events must be able to occur at ANY step across the full simulation horizon,
+  not just at one hardcoded step number.
+  Use stochastic timing: event_time = np.random.poisson(expected_step)
+  NOT: if step == 2:
+
+UNKNOWN vs FALSE POSITIVE — MANDATORY DISTINCTION:
+  Do NOT combine "unknown attack" and "false positive" into one bucket.
+
+  unknown_attack_mechanism:
+    Meaning: A real incident occurred but the mechanism is unidentified by the model.
+    Use when: All modeled hypotheses fail in a trial AND the alert was genuine.
+    Label:    outcome = "unknown_attack_mechanism"
+
+  false_positive:
+    Meaning: No actual incident occurred; the alert was spurious.
+    Use when: The model explicitly simulates alert reliability and the alert fires
+              even though no hypothesis succeeds.
+    Label:    outcome = "false_positive"
+
+  ONLY use "false_positive" if your model explicitly includes P(alert | no incident).
+  If your model does NOT model alert reliability, use "unknown_attack_mechanism"
+  for unresolved trials. Never combine both into a single bucket label.
+
+OUTCOME STRUCTURE:
+  "outcomes": {{
+    "branch_<H1>_success_flag": [...per-run 0/1...],
+    "branch_<H2>_success_flag": [...per-run 0/1...],
+    "unknown_attack_flag":      [...per-run 0/1...],
+    "false_positive_flag":      [...per-run 0/1...],  # only if modeled
+    "dominant_branch_observed_rate": <scalar float>
+  }}
+
+This makes your simulation a genuine investigation model, not a
+single-event Monte Carlo repeated 100 times.
+
+═══════════════════════════════════════════════════
+PART 12 — CONSTRAINT ENFORCEMENT (CRITICAL)
+═══════════════════════════════════════════════════
+
+Hard constraints derived from USER_PROVIDED evidence must INVALIDATE
+incompatible causal branches BEFORE any probability roll is made.
+
+THE SMOKING-GUN ANTI-PATTERN — this exact code structure is FORBIDDEN:
+
+  # ❌ FORBIDDEN: probabilistic constraint violation
+  if world["state"]["employee_status"] == "asleep" and np.random.random() < 0.05:
+      physical_access_violated_flag = 1
+
+  Why is this wrong?
+    - It still rolls a random number while the employee is asleep.
+    - It allows the impossible event to occur 5% of the time.
+    - A hard constraint should NEVER be paired with a probability roll.
+    - This is a constraint-as-probability anti-pattern.
+
+DISTINCTION:
+  Hypothesis:  "Could the insider have acted?"       ← investigative question, can roll
+  Constraint:  "Is physical access logically possible?"  ← physical limit, NO roll allowed
+
+CORRECT THREE-LEVEL ENFORCEMENT TEMPLATE:
+
+  # Level 1: Evaluate the constraint from USER_PROVIDED state (no randomness)
+  physical_access_possible = (
+      world["state"]["employee_status"] != "asleep"
+  )  # USER_PROVIDED evidence
+
+  # Level 2: Block the branch BEFORE any probability roll
+  if not physical_access_possible:
+      insider_manual_branch_active = False
+      # Record that a branch was blocked (for validation output)
+      physical_access_constraint_flags.append(1)  # 1 = constraint active this run
+  else:
+      insider_manual_branch_active = True
+      physical_access_constraint_flags.append(0)
+
+  # Level 3: Only THEN do the probability roll — but only for the active branch
+  if insider_manual_branch_active:
+      roll = np.random.random()
+      if roll < p_model_insider_manual:
+          # insider manual action succeeded
+          ...
+
+KEY RULE: Rename "constraint_violations" to "constraint_application":
+  "constraint_application": {{
+      "physical_access_constraint_blocked_flag": physical_access_constraint_flags
+  }}
+  Never name this "constraint_violations" when recording that a constraint was enforced or a branch was blocked.
+
+CLARIFY BLOCKED HYPOTHESIS PARAMETERS:
+  If a parameter (e.g. p_model_physical_access = 0.05) belongs to a hypothesis/branch
+  that is deterministically blocked by a hard constraint (e.g. H3 blocked because employee is asleep),
+  explicitly document in comments and in the parameters JSON metadata:
+    "p_model_physical_access": {{
+        "value": 0.05,
+        "provenance": "MODEL_ASSUMPTION",
+        "evaluation_status": "not_evaluated_deterministically_blocked",
+        "note": "P_MODEL_PHYSICAL_ACCESS = 0.05 is not evaluated because H3 is deterministically blocked before sampling."
+    }}
+  Do NOT roll a random number against this parameter.
+
+BAYESIAN POSTERIOR vs. SIMULATION ELIGIBILITY (ARCHITECTURAL DISTINCTION):
+  Make the architectural distinction explicit:
+    - Bayesian posterior (e.g. H3 Bayesian posterior = 1.23%): Statistical belief updated from evidence.
+    - Simulation eligibility (e.g. H3 simulation eligibility = 0%): Feasibility for simulation execution.
+  Because the employee is confirmed asleep, H3 has 0% simulation eligibility and is deterministically
+  blocked before sampling.
+
+FOR HYPOTHESES THAT SURVIVE CONSTRAINT CHECKING:
+  Some insider hypotheses do NOT require physical access
+  (e.g. remote credential theft, compromised session token).
+  These are NOT blocked by the physical alibi constraint.
+  Model them separately:
+    insider_remote_credential_branch  ← NOT blocked by alibi constraint
+    insider_manual_physical_branch    ← IS blocked by alibi constraint
+
+  Only the manual-physical sub-branch is deactivated. The remote sub-branch
+  remains active and uses its own probability roll normally.
+
+═══════════════════════════════════════════════════
+PART 13 — BAYESIAN-TO-SIMULATION PARAMETER BRIDGE
+═══════════════════════════════════════════════════
+
+The Bayesian Hypothesis Analysis provided above contains POSTERIOR PROBABILITIES
+for each hypothesis. These posteriors MUST be used as the basis for the
+simulation branch activation probabilities, not invented independently.
+
+CONCRETE RULE:
+  For each hypothesis H_i with posterior p_i from the Bayesian analysis:
+    branch_weight[H_i] = p_i  # [DERIVED from Bayesian updater]
+
+  When a Monte Carlo trial begins, sample which branch is "active" using:
+    active_branch = np.random.choice(branch_names, p=branch_weights)
+
+  Then simulate the full causal chain for that branch.
+
+This means the Bayesian posteriors DRIVE the simulation, not just decorate the report.
+
+In the SIMULATION_RESULTS_JSON, expose the bridge explicitly:
+  "parameters": {{
+    "bayesian_posteriors_used": {{
+      "<hypothesis_name>": {{"posterior": <float>, "provenance": "DERIVED",
+                              "source": "hypothesis_updater_node"}},
+      ...
+    }}
+  }}
+
+If the Bayesian analysis was not available (e.g. empty hypothesis_analysis),
+fall back to MODEL_ASSUMPTION weights and label them as such.
+NEVER silently use assumed probabilities when Bayesian posteriors are available.
 """
 
     messages = [
@@ -524,7 +1091,7 @@ The code must be syntactically valid, complete, and executable without modificat
 
     log_step_progress("Sending specification to Simulation Architect LLM...")
     start_time = time.time()
-    response = llm.invoke(messages)
+    response = llm_invoke_safe(messages, node_name="PLANNER")
     elapsed = time.time() - start_time
     content = response.content
 
@@ -544,32 +1111,40 @@ The code must be syntactically valid, complete, and executable without modificat
         "critic_approved": False,
         "critic_feedback": "",
         "validation_report": "",
+        "language": target_lang,
     }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 3 — MODEL CRITIC
-# ──────────────────────────────────────────────────────────────────────────────
-
-def critic_node(state: SimulationState) -> SimulationState:
+def critic_node(state: SimulationState) -> SimulationState: #node 3
     """
     Model Critic: Reviews the generated simulation code against the specification.
     Flags methodology mislabelling, provenance violations, assumption extrapolation,
     determinism, and fairness issues — before execution.
     """
+    target_lang = _get_language(state)
     log_step_start(
         "CRITIC",
-        f"Reviewing code for scientific validity using '{settings.MODEL_NAME}'..."
+        f"Reviewing code for scientific validity [{target_lang}] using '{settings.MODEL_NAME}'..."
     )
 
     spec = state.get("simulation_spec", "No specification available.")
     code = state.get("generated_code", "")
+
+    lang_instruction = f"""
+═══════════════════════════════════════════════════
+LANGUAGE REQUIREMENT (MANDATORY — HIGHEST PRIORITY)
+═══════════════════════════════════════════════════
+
+The user scenario is written in '{target_lang}'.
+Write the critique review, evaluation summary, identified problems, and revision recommendations in the EXACT SAME LANGUAGE as the user scenario ({target_lang}).
+Keep JSON keys ("approved", "severity", "issues", etc.) in English for program compatibility.
+"""
 
     prompt = f"""
 You are the Model Critic of a Universal AI Simulation Engine.
 
 Review the generated simulation code for scientific, methodological,
 and structural problems BEFORE it is executed.
+{lang_instruction}
 
 --------------------------------------------------
 SIMULATION SPECIFICATION (with provenance labels)
@@ -640,7 +1215,7 @@ Review the code against ALL of the following criteria:
     - Does the code print a SIMULATION_RESULTS_JSON: block?
     - Does the JSON include: metadata, initial_conditions (with provenance),
       parameters (with provenance), assumptions (with provenance + justification),
-      outcomes, constraint_violations, events, decisions?
+      outcomes, constraint_application (or constraint_violations), events, decisions?
     - FLAG CRITICAL: if the JSON block is missing entirely.
     - FLAG WARNING: if provenance fields are absent from parameters.
 
@@ -648,6 +1223,92 @@ Review the code against ALL of the following criteria:
     - Are there potential runtime errors (undefined variables, division by zero)?
     - Does the code include np.random.seed(42) or equivalent?
     - FLAG WARNING: if no random seed is present.
+
+12. PROBABILITY_METRIC_SEPARATION
+    - Are model-estimated probability, simulated outcome, and likelihood score kept SEPARATE?
+    - FLAG CRITICAL: if a binary success outcome (0/1) is directly used as a probability score
+      (e.g. attack_vector_likelihood = 1.0 if success else effective_prob).
+    - FLAG CRITICAL: if the observed Monte Carlo success rate is conflated with a model prior.
+    - FLAG CRITICAL: if the "likelihood" field in JSON outcomes mixes a fixed assumption with
+      a stochastic simulation result.
+    - REQUIRED PATTERN: code must separately compute AND report:
+        (a) p_model_<event>       — the assumed probability (MODEL_ASSUMPTION constant)
+        (b) success_flag          — per-trial 0/1 outcome (stochastic)
+        (c) observed_success_rate — computed AFTER all runs as successes/total_runs
+
+13. CAUSAL_BRANCH_COVERAGE
+    - If the spec lists multiple competing hypotheses with posteriors > 5%, does the simulation
+      model EACH as a separate causal branch?
+    - FLAG WARNING: if only the dominant hypothesis is modeled and secondary hypotheses
+      (posterior > 5%) are ignored.
+    - FLAG CRITICAL: if the spec indicates multi_branch_required=true but the code only
+      has a single causal path.
+    - FLAG WARNING: if meaningful events only occur at a single hardcoded time step
+      (e.g. all activity at step 2 of a 24-step simulation). Events should be able to
+      occur at any step via stochastic timing.
+
+14. OUTCOME_VARIABLE_NAMING
+    - Do variable names for per-trial 0/1 outcomes avoid the words "probability" or "likelihood"?
+    - FLAG CRITICAL: if any list of binary per-trial values (e.g. [1.0, 0.0, 1.0, ...]) is
+      stored in a variable whose name contains "probability" or "likelihood".
+      Examples of BAD names: probability_of_remote_exploitation, attack_likelihood
+      Examples of GOOD names: remote_exploitation_success_flag, exploit_outcome_flag
+    - FLAG WARNING: if the scalar post-run observed rate is stored in a variable whose name
+      does NOT clearly indicate it is a rate or frequency (e.g. "exploit_observed_rate").
+    - FLAG WARNING: if 'unknown_or_false_positive' is used as a single bucket label —
+      these must be split into 'unknown_attack_mechanism' and 'false_positive' separately.
+
+15. CONSTRAINT_ENFORCEMENT
+    - Do hard USER_PROVIDED constraints actively INVALIDATE incompatible branches
+      BEFORE any probability roll?
+    - FLAG CRITICAL: if constraint checking uses a random roll, e.g.:
+        if employee_status == 'asleep' and np.random.random() < 0.05:
+            physical_access_violated_flag = 1
+      This is the smoking-gun anti-pattern. The constraint must set branch_active = False
+      BEFORE any np.random call, not after a probability roll.
+    - FLAG CRITICAL: if a physically-impossible branch produces non-zero successes in
+      the simulation output (e.g. physical_access_violated: [0,0,1,...] means a
+      constraint was violated and the impossible event actually occurred in the model).
+    - FLAG CRITICAL: if constraint_application or constraint_violations reports that an impossible event occurred
+      in N/total_runs runs (e.g. 'Physical Access Constraint Violations: 3 / 100').
+    - REQUIRED: constraint enforcement must be tracked under "constraint_application":
+        "constraint_application": {{
+            "physical_access_constraint_blocked_flag": physical_access_constraint_flags
+        }}
+    - FLAG WARNING: if P_MODEL_PHYSICAL_ACCESS is evaluated with random rolls when H3 is deterministically blocked.
+    - FLAG WARNING: if the code does not distinguish Bayesian posterior (e.g. 1.23%) from simulation eligibility (0%).
+    - ACCEPTABLE: a branch that does NOT require physical access (remote credential
+      theft) is not constrained by a physical alibi.
+
+16. BAYESIAN_PARAMETER_BRIDGE
+    - Are the Bayesian posterior probabilities from hypothesis_analysis actually used
+      as the branch weights in the Monte Carlo sampling?
+    - FLAG WARNING: if the planner had access to a hypothesis_analysis block but the
+      code uses independently invented probabilities (e.g. exploit_prob = 0.85) without
+      referencing the Bayesian posteriors.
+    - FLAG WARNING: if the structured output's parameters block does NOT include a
+      'bayesian_posteriors_used' field when posteriors were available.
+    - ACCEPTABLE: if hypothesis_analysis was empty/unavailable, MODEL_ASSUMPTION
+      weights are acceptable and should be labelled as such.
+
+17. STATISTICAL_REPORTING
+    - Is every ±value in the report computed from an actual per-run array?
+    - FLAG CRITICAL: if the summary block contains '<metric>_std' values that are
+      not computed from a per-run list using np.std(array, ddof=1).
+    - FLAG CRITICAL: if 'dominant_branch_observed_rate_std: 0.0' appears in the JSON.
+      This is meaningless — dominant_branch_observed_rate is a derived scalar, not
+      an array. std of a scalar is always 0 and tells you nothing.
+    - FLAG CRITICAL: if the human-readable output prints 'X% ± Y%' but Y is not
+      computed from a corresponding per-run flag array.
+    - REQUIRED PATTERN:
+        h1_std = np.std(branch_h1_success_flags, ddof=1)  # from array
+        print(f'H1: {{h1_observed_rate:.1%}} ± {{h1_std:.1%}}')
+    - FLAG WARNING: if no per-branch standard deviation is reported at all.
+
+18. TERMINOLOGY_PRECISION
+    - Does the code or human readable output use "MODELED LEADING SCENARIO" instead of "DETERMINATION"?
+    - Does it use "most frequently successful modeled pathway" instead of "validated pathway"?
+    - FLAG WARNING: if "DETERMINATION" or "validated pathway" appears in code prints or docstrings.
 
 Respond ONLY with a valid JSON object:
 {{
@@ -685,7 +1346,7 @@ Minor issues and warnings are acceptable — approve but list them.
 
     log_step_progress("Sending code to LLM for scientific validity review...")
     start_time = time.time()
-    response = llm.invoke(messages)
+    response = llm_invoke_safe(messages, node_name="CRITIC")
     elapsed = time.time() - start_time
 
     raw = response.content or ""
@@ -738,14 +1399,10 @@ Minor issues and warnings are acceptable — approve but list them.
     return {
         "critic_approved": approved,
         "critic_feedback": feedback_str,
+        "language": target_lang,
     }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 4 — EXECUTOR
-# ──────────────────────────────────────────────────────────────────────────────
-
-def executor_node(state: SimulationState) -> SimulationState:
+def executor_node(state: SimulationState) -> SimulationState: #node 4
     """
     Executor: Runs the AI-generated code inside the sandbox environment.
     Also extracts the structured SIMULATION_RESULTS_JSON block from stdout.
@@ -792,12 +1449,7 @@ def executor_node(state: SimulationState) -> SimulationState:
         "structured_results": structured_results,
     }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 5 — RESULT VALIDATOR (pure Python — no LLM call)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def validator_node(state: SimulationState) -> SimulationState:
+def validator_node(state: SimulationState) -> SimulationState: #node 5
     """
     Result Validator: Pure Python post-execution consistency checks.
     No LLM call. Cross-checks that the structured output is internally
@@ -823,8 +1475,7 @@ def validator_node(state: SimulationState) -> SimulationState:
         else:
             log_step_progress(f"{'⚠' if severity == 'WARN' else '✗'} {name}: {detail}")
 
-    # ── Check 1: Execution success ────────────────────────────────────
-    has_error = bool(state.get("execution_error", "").strip())
+    has_error = bool(state.get("execution_error", "").strip()) #check 1
     _check(
         "execution_success",
         not has_error,
@@ -832,8 +1483,7 @@ def validator_node(state: SimulationState) -> SimulationState:
         "Execution produced stderr" if has_error else "Clean execution"
     )
 
-    # ── Check 2: Structured results present ──────────────────────────
-    structured_raw = state.get("structured_results", "")
+    structured_raw = state.get("structured_results", "") #check 2
     has_structured = bool(structured_raw.strip())
     _check(
         "structured_results_present",
@@ -851,8 +1501,7 @@ def validator_node(state: SimulationState) -> SimulationState:
             _check("structured_results_parseable", False, "FAIL",
                    "SIMULATION_RESULTS_JSON could not be parsed as JSON")
 
-    # ── Check 3: Required metadata fields ────────────────────────────
-    metadata = data.get("metadata", {})
+    metadata = data.get("metadata", {}) #check 3
     has_runs = "runs" in metadata
     has_methodology = "methodology" in metadata and bool(metadata.get("methodology"))
     has_seed = "seed" in metadata
@@ -864,8 +1513,7 @@ def validator_node(state: SimulationState) -> SimulationState:
            "No random seed recorded — results not reproducible" if not has_seed
            else f"seed = {metadata.get('seed')}")
 
-    # ── Check 4: Methodology is a known value ────────────────────────
-    known_methods = {
+    known_methods = { #check 4
         "deterministic_simulation", "stochastic_simulation", "monte_carlo",
         "discrete_event_simulation", "system_dynamics", "agent_based_simulation",
         "game_theoretic", "hybrid"
@@ -876,8 +1524,7 @@ def validator_node(state: SimulationState) -> SimulationState:
            f"'{declared_method}' is not in the approved methodology taxonomy"
            if not method_known else f"methodology='{declared_method}'")
 
-    # ── Check 5: Outcomes block is non-empty with finite values ───────
-    outcomes = data.get("outcomes", {})
+    outcomes = data.get("outcomes", {}) #check 5
     has_outcomes = isinstance(outcomes, dict) and len(outcomes) > 0
     _check("outcomes_present", has_outcomes, "WARN",
            "No outcome metrics in structured results" if not has_outcomes
@@ -894,8 +1541,7 @@ def validator_node(state: SimulationState) -> SimulationState:
            f"Non-finite values in: {non_finite_metrics}" if non_finite_metrics
            else "All outcome values are finite")
 
-    # ── Check 6: Assumptions list non-empty with provenance ───────────
-    assumptions = data.get("assumptions", [])
+    assumptions = data.get("assumptions", []) #check 6
     has_assumptions = isinstance(assumptions, list) and len(assumptions) > 0
     _check("assumptions_present", has_assumptions, "WARN",
            "assumptions list is empty — model parameters not documented"
@@ -910,15 +1556,13 @@ def validator_node(state: SimulationState) -> SimulationState:
            f"Missing provenance on: {missing_provenance}" if missing_provenance
            else "All assumptions have provenance labels")
 
-    # ── Check 7: Constraint violations block ─────────────────────────
-    cv = data.get("constraint_violations", {})
-    has_cv = isinstance(cv, dict) and len(cv) > 0
-    _check("constraint_violations_tracked", has_cv, "WARN",
-           "No constraint_violations block — can't compute violation probability"
-           if not has_cv else f"{len(cv)} constraint(s) tracked")
+    ca = data.get("constraint_application") or data.get("constraint_violations", {}) #check 7
+    has_ca = isinstance(ca, dict) and len(ca) > 0
+    _check("constraint_application_tracked", has_ca, "WARN",
+           "No constraint_application block — can't compute constraint application probability"
+           if not has_ca else f"{len(ca)} constraint(s) tracked")
 
-    # ── Check 8: Events and decisions logged ─────────────────────────
-    events = data.get("events", [])
+    events = data.get("events", []) #check 8
     decisions = data.get("decisions", [])
     has_events = isinstance(events, list) and len(events) > 0
     has_decisions = isinstance(decisions, list) and len(decisions) > 0
@@ -929,8 +1573,7 @@ def validator_node(state: SimulationState) -> SimulationState:
            "No decisions logged — analyst cannot explain WHY things changed"
            if not has_decisions else f"{len(decisions)} decision(s) logged")
 
-    # ── Check 9: Initial conditions have provenance ───────────────────
-    init_conds = data.get("initial_conditions", {})
+    init_conds = data.get("initial_conditions", {}) #check 9
     ic_missing_prov = []
     for k, v in init_conds.items():
         if isinstance(v, dict) and not v.get("provenance"):
@@ -939,15 +1582,13 @@ def validator_node(state: SimulationState) -> SimulationState:
            f"Missing provenance on initial conditions: {ic_missing_prov}"
            if ic_missing_prov else "All initial conditions have provenance labels")
 
-    # ── Check 10: Number of runs is sufficient ────────────────────────
-    runs_val = metadata.get("runs", 0)
+    runs_val = metadata.get("runs", 0) #check 10
     runs_ok = isinstance(runs_val, int) and runs_val >= 100
     _check("sufficient_runs", runs_ok, "WARN",
            f"Only {runs_val} runs — recommend ≥ 100 for statistical reliability"
            if not runs_ok else f"{runs_val} runs — statistically adequate")
 
-    # ── Summary ───────────────────────────────────────────────────────
-    fails = [c for c in checks if c["status"] == "FAIL"]
+    fails = [c for c in checks if c["status"] == "FAIL"] #summary
     warns = [c for c in checks if c["status"] == "WARN"]
     passes = [c for c in checks if c["status"] == "PASS"]
 
@@ -976,53 +1617,334 @@ def validator_node(state: SimulationState) -> SimulationState:
 
     return {"validation_report": json.dumps(validation_report, indent=2)}
 
+STATS_I18N = {
+    "English": {
+        "title": "## Statistical Analysis (Python-computed)\n",
+        "metadata": "### Experiment Metadata",
+        "methodology_note": "Methodology note",
+        "sim_summary": "### Simulation-Computed Summary",
+        "statistic": "Statistic",
+        "value": "Value",
+        "mean": "Mean",
+        "median": "Median",
+        "std_dev": "Std Dev",
+        "min": "Min",
+        "max": "Max",
+        "p10": "P10",
+        "p25": "P25",
+        "p75": "P75",
+        "p90": "P90",
+        "p_success": "P(success)",
+        "p_failure": "P(failure)",
+        "dist_type": "Distribution Type",
+        "prop_se": "Proportion Std Error (SE)",
+        "ci_95": "Monte Carlo 95% CI",
+        "bernoulli_note": "Note: Metric is a discrete binary variable (Bernoulli distribution). Std Dev is sqrt(p*(1-p)) across discrete runs, NOT a forecast prediction error or confidence interval (do not report as X% ± Y%).",
+        "ci_note": "Note: The 95% confidence interval reflects ONLY Monte Carlo numerical sampling uncertainty from the trial count (±1.96*SE), NOT a real-world predictive interval.",
+        "sensitivity_header": "### Parameter Sensitivity Sweep (Python-computed)",
+        "sens_param": "Parameter Value",
+        "sens_rate": "Modeled Outcome Rate",
+        "ca_header": "### Constraint Application / Enforcement Analysis (Python-computed)",
+        "ca_constraint": "Constraint",
+        "ca_mean_blocked": "Mean Blocked/Run",
+        "ca_prob_blocked": "P(≥1 Blocked)",
+        "ca_max_blocked": "Max Blocked",
+        "events_header": "### Event Frequency (from representative run)",
+        "event_type": "Event Type",
+        "count": "Count",
+        "decisions_header": "### Decision Frequency (from representative run)",
+        "decision": "Decision",
+        "scenario_header": "### Scenario Comparison",
+        "scenario": "Scenario",
+        "assumptions_header": "### Model Assumptions (from simulation — with provenance)",
+        "parameter": "Parameter",
+        "provenance": "Provenance",
+        "justification": "Justification",
+        "term_reason": "Termination reason",
+        "no_results": "No structured results available for statistical analysis.",
+        "parse_error": "Could not parse structured results.",
+        "no_numeric": "*No numeric list metrics found in outcomes block.*\n",
+    },
+    "Chinese": {
+        "title": "## 统计分析（Python原生计算）\n",
+        "metadata": "### 实验元数据",
+        "methodology_note": "方法论说明",
+        "sim_summary": "### 模拟计算摘要",
+        "statistic": "统计指标",
+        "value": "数值",
+        "mean": "均值 (Mean)",
+        "median": "中位数 (Median)",
+        "std_dev": "标准差 (Std Dev)",
+        "min": "极小值 (Min)",
+        "max": "极大值 (Max)",
+        "p10": "10分位数 (P10)",
+        "p25": "25分位数 (P25)",
+        "p75": "75分位数 (P75)",
+        "p90": "90分位数 (P90)",
+        "p_success": "成功概率 P(success)",
+        "p_failure": "失败概率 P(failure)",
+        "dist_type": "分布类型 (Distribution Type)",
+        "prop_se": "比例标准误 (Standard Error, SE)",
+        "ci_95": "Monte Carlo 95% 抽样置信区间",
+        "bernoulli_note": "说明：该指标为离散二元变量（伯努利分布）。标准差反映的是单次运行成功/不成功的离散方差 sqrt(p*(1-p))，绝非预测置信区间或预测误差（严禁写作 X% ± Y%）。",
+        "ci_note": "说明：95% 置信区间仅反映当前模拟抽样次数带来的数值不确定性 (±1.96*SE)，绝不代表现实世界发生概率的 95% 预测区间。",
+        "sensitivity_header": "### 参数敏感性分析（Python原生扫描计算）",
+        "sens_param": "参数取值",
+        "sens_rate": "模拟结局发生率",
+        "ca_header": "### 约束应用与执行分析（Python原生计算）",
+        "ca_constraint": "约束名称",
+        "ca_mean_blocked": "单次运行平均阻断数",
+        "ca_prob_blocked": "P(≥1次被阻断概率)",
+        "ca_max_blocked": "最大阻断数",
+        "events_header": "### 事件发生频率（来自代表性运行）",
+        "event_type": "事件类型",
+        "count": "频次",
+        "decisions_header": "### 决策频率（来自代表性运行）",
+        "decision": "决策内容",
+        "scenario_header": "### 情景对比",
+        "scenario": "情景名称",
+        "assumptions_header": "### 模型假设（来自模拟 — 附来源追踪）",
+        "parameter": "参数名称",
+        "provenance": "来源 (Provenance)",
+        "justification": "假设依据理由",
+        "term_reason": "终止原因",
+        "no_results": "暂无可用结构化结果进行统计分析。",
+        "parse_error": "无法解析结构化结果。",
+        "no_numeric": "*未在结果数据块中发现数值型列表指标。*\n",
+    },
+    "Spanish": {
+        "title": "## Análisis Estadístico (Calculado con Python)\n",
+        "metadata": "### Metadatos del Experimento",
+        "methodology_note": "Nota metodológica",
+        "sim_summary": "### Resumen Computado de la Simulación",
+        "statistic": "Estadística",
+        "value": "Valor",
+        "mean": "Media",
+        "median": "Mediana",
+        "std_dev": "Desviación Estándar",
+        "min": "Mín",
+        "max": "Máx",
+        "p10": "P10",
+        "p25": "P25",
+        "p75": "P75",
+        "p90": "P90",
+        "p_success": "P(éxito)",
+        "p_failure": "P(fallo)",
+        "dist_type": "Tipo de Distribución",
+        "prop_se": "Error Estándar de la Proporción (SE)",
+        "ci_95": "Intervalo de Confianza del 95% (Monte Carlo)",
+        "bernoulli_note": "Nota: La variable es binaria discreta (distribución de Bernoulli). La desviación estándar es sqrt(p*(1-p)) entre ejecuciones discretas, NO un intervalo de predicción/confianza (no reportar como X% ± Y%).",
+        "ci_note": "Nota: El intervalo del 95% refleja ÚNICAMENTE la incertidumbre del muestreo numérico de Monte Carlo (±1.96*SE), NO un intervalo de predicción del mundo real.",
+        "sensitivity_header": "### Barrido de Sensibilidad de Parámetros (Calculado con Python)",
+        "sens_param": "Valor del Parámetro",
+        "sens_rate": "Tasa de Resultado Modelada",
+        "ca_header": "### Análisis de Aplicación de Restricciones (Calculado con Python)",
+        "ca_constraint": "Restricción",
+        "ca_mean_blocked": "Media Bloqueada/Ejecución",
+        "ca_prob_blocked": "P(≥1 Bloqueado)",
+        "ca_max_blocked": "Máximo Bloqueado",
+        "events_header": "### Frecuencia de Eventos (Ejecución Representativa)",
+        "event_type": "Tipo de Evento",
+        "count": "Cantidad",
+        "decisions_header": "### Frecuencia de Decisiones (Ejecución Representativa)",
+        "decision": "Decisión",
+        "scenario_header": "### Comparación de Escenarios",
+        "scenario": "Escenario",
+        "assumptions_header": "### Supuestos del Modelo (Con Procedencia)",
+        "parameter": "Parámetro",
+        "provenance": "Procedencia",
+        "justification": "Justificación",
+        "term_reason": "Razón de terminación",
+        "no_results": "No hay resultados estructurados disponibles para análisis estadístico.",
+        "parse_error": "No se pudieron procesar los resultados estructurados.",
+        "no_numeric": "*No se encontraron métricas numéricas en los resultados.*\n",
+    },
+    "French": {
+        "title": "## Analyse Statistique (Calculée par Python)\n",
+        "metadata": "### Métadonnées de l'Expérience",
+        "methodology_note": "Note méthodologique",
+        "sim_summary": "### Résumé Calculé de la Simulation",
+        "statistic": "Statistique",
+        "value": "Valeur",
+        "mean": "Moyenne",
+        "median": "Médiane",
+        "std_dev": "Écart-type",
+        "min": "Min",
+        "max": "Max",
+        "p10": "P10",
+        "p25": "P25",
+        "p75": "P75",
+        "p90": "P90",
+        "p_success": "P(succès)",
+        "p_failure": "P(échec)",
+        "dist_type": "Type de Distribution",
+        "prop_se": "Erreur Standard de Proportion (SE)",
+        "ci_95": "Intervalle de Confiance à 95% (Monte Carlo)",
+        "bernoulli_note": "Note: Variable binaire discrète (distribution de Bernoulli). L'écart-type est sqrt(p*(1-p)), et NON un intervalle de prédiction/confiance (ne pas rapporter sous forme de X% ± Y%).",
+        "ci_note": "Note: L'intervalle de 95% reflète UNIQUEMENT l'incertitude numérique d'échantillonnage de Monte Carlo (±1.96*SE), et NON un intervalle prédictif du monde réel.",
+        "sensitivity_header": "### Balayage de Sensibilité des Paramètres (Calculé par Python)",
+        "sens_param": "Valeur du Paramètre",
+        "sens_rate": "Taux de Résultat Modélisé",
+        "ca_header": "### Analyse de l'Application des Contraintes (Calculée par Python)",
+        "ca_constraint": "Contrainte",
+        "ca_mean_blocked": "Moyenne Bloquée/Exécution",
+        "ca_prob_blocked": "P(≥1 Bloqué)",
+        "ca_max_blocked": "Max Bloqué",
+        "events_header": "### Fréquence des Événements (Exécution Représentative)",
+        "event_type": "Type d'Événement",
+        "count": "Nombre",
+        "decisions_header": "### Fréquence des Décisions (Exécution Représentative)",
+        "decision": "Décision",
+        "scenario_header": "### Comparaison des Scénarios",
+        "scenario": "Scénario",
+        "assumptions_header": "### Hypothèses du Modèle (Avec Provenance)",
+        "parameter": "Paramètre",
+        "provenance": "Provenance",
+        "justification": "Justification",
+        "term_reason": "Raison de terminaison",
+        "no_results": "Aucun résultat structuré disponible pour l'analyse statistique.",
+        "parse_error": "Impossible de traiter les résultats structurés.",
+        "no_numeric": "*Aucune métrique numérique trouvée dans les résultats.*\n",
+    },
+    "German": {
+        "title": "## Statistische Analyse (Python-berechnet)\n",
+        "metadata": "### Experiment-Metadaten",
+        "methodology_note": "Methodischer Hinweis",
+        "sim_summary": "### Berechnete Simulationszusammenfassung",
+        "statistic": "Statistik",
+        "value": "Wert",
+        "mean": "Mittelwert",
+        "median": "Median",
+        "std_dev": "Standardabweichung",
+        "min": "Min",
+        "max": "Max",
+        "p10": "P10",
+        "p25": "P25",
+        "p75": "P75",
+        "p90": "P90",
+        "p_success": "P(Erfolg)",
+        "p_failure": "P(Fehlschlag)",
+        "dist_type": "Verteilungstyp",
+        "prop_se": "Standardfehler des Anteils (SE)",
+        "ci_95": "Monte-Carlo 95% Konfidenzintervall",
+        "bernoulli_note": "Hinweis: Diskrete binäre Variable (Bernoulli-Verteilung). Standardabweichung ist sqrt(p*(1-p)), KEIN Vorhersage-/Konfidenzintervall (nicht als X% ± Y% angeben).",
+        "ci_note": "Hinweis: Das 95%-Konfidenzintervall spiegelt NUR die numerische Stichprobenunsicherheit von Monte Carlo wider (±1.96*SE), KEIN reales Vorhersageintervall.",
+        "sensitivity_header": "### Parametersensitivitätsanalyse (Python-berechnet)",
+        "sens_param": "Parameterwert",
+        "sens_rate": "Modellierte Ergebnisrate",
+        "ca_header": "### Analyse der Einschränkungsanwendung (Python-berechnet)",
+        "ca_constraint": "Einschränkung",
+        "ca_mean_blocked": "Mittelwert Blockiert/Lauf",
+        "ca_prob_blocked": "P(≥1 Blockiert)",
+        "ca_max_blocked": "Max Blockiert",
+        "events_header": "### Ereignishäufigkeit",
+        "event_type": "Ereignistyp",
+        "count": "Anzahl",
+        "decisions_header": "### Entscheidungshäufigkeit",
+        "decision": "Entscheidung",
+        "scenario_header": "### Szenarienvergleich",
+        "scenario": "Szenario",
+        "assumptions_header": "### Modellannahmen (Mit Herkunft)",
+        "parameter": "Parameter",
+        "provenance": "Herkunft",
+        "justification": "Begründung",
+        "term_reason": "Beendigungsgrund",
+        "no_results": "Keine strukturierten Ergebnisse für die statistische Analyse verfügbar.",
+        "parse_error": "Strukturierte Ergebnisse konnten nicht verarbeitet werden.",
+        "no_numeric": "*Keine numerischen Metriken gefunden.*\n",
+    },
+    "Japanese": {
+        "title": "## 統計分析（Python計算）\n",
+        "metadata": "### 実験メタデータ",
+        "methodology_note": "方法論ノート",
+        "sim_summary": "### シミュレーション計算サマリー",
+        "statistic": "統計指標",
+        "value": "値",
+        "mean": "平均値 (Mean)",
+        "median": "中央値 (Median)",
+        "std_dev": "標準偏差 (Std Dev)",
+        "min": "最小値 (Min)",
+        "max": "最大値 (Max)",
+        "p10": "10パーセンタイル (P10)",
+        "p25": "25パーセンタイル (P25)",
+        "p75": "75パーセンタイル (P75)",
+        "p90": "90パーセンタイル (P90)",
+        "p_success": "成功確率 P(success)",
+        "p_failure": "失敗確率 P(failure)",
+        "dist_type": "分布型 (Distribution Type)",
+        "prop_se": "比率の標準誤差 (Standard Error, SE)",
+        "ci_95": "モンテカルロ 95% サンプリング信頼区間",
+        "bernoulli_note": "説明: この指標は離散2値変数（ベルヌーイ分布）です。標準偏差は試行間の離散分散 sqrt(p*(1-p)) であり、予測誤差や信頼区間ではありません（X% ± Y% と表記しないでください）。",
+        "ci_note": "説明: 95%信頼区間は試行回数に由来するモンテカルロ数値サンプリングの不確かさ（±1.96*SE）のみを反映しており、現実世界における95%予測区間ではありません。",
+        "sensitivity_header": "### パラメータ感度分析（Pythonスキャン計算）",
+        "sens_param": "パラメータ値",
+        "sens_rate": "モデル化された結果発生率",
+        "ca_header": "### 制約適用・強制分析（Python計算）",
+        "ca_constraint": "制約名",
+        "ca_mean_blocked": "実行あたりの平均ブロック数",
+        "ca_prob_blocked": "P(≥1回ブロック確率)",
+        "ca_max_blocked": "最大ブロック数",
+        "events_header": "### イベント頻度（代表的試行）",
+        "event_type": "イベント種別",
+        "count": "回数",
+        "decisions_header": "### 意思決定頻度（代表的試行）",
+        "decision": "意思决定内容",
+        "scenario_header": "### シナリオ比較",
+        "scenario": "シナリオ名",
+        "assumptions_header": "### モデル前提条件（出典・根拠付き）",
+        "parameter": "パラメータ名",
+        "provenance": "出典 (Provenance)",
+        "justification": "前提理由",
+        "term_reason": "終了理由",
+        "no_results": "統計分析に利用可能な構造化結果がありません。",
+        "parse_error": "構造化結果を解析できませんでした。",
+        "no_numeric": "*数値指標が見つかりませんでした。*\n",
+    }
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 6 — STATISTICAL ANALYSIS
-# ──────────────────────────────────────────────────────────────────────────────
-
-def stats_node(state: SimulationState) -> SimulationState:
+def stats_node(state: SimulationState) -> SimulationState: #node 6
     """
     Stats: Computes Python-native statistics from the structured simulation results.
     Mean, median, std, percentiles, constraint violation probability, event
     frequency — calculated in Python, not by the LLM.
+    Supports multi-language localized markdown output.
     """
+    target_lang = _get_language(state)
     log_step_start(
         "STATS",
-        "Computing statistical summary from structured simulation results..."
+        f"Computing statistical summary [{target_lang}] from structured simulation results..."
     )
     start_time = time.time()
+
+    t = STATS_I18N.get(target_lang, STATS_I18N["English"])
 
     structured = state.get("structured_results", "")
     if not structured:
         log_step_warning("STATS", "No structured results — skipping statistical analysis")
-        return {"statistical_summary": "No structured results available for statistical analysis."}
+        return {"statistical_summary": t["no_results"], "language": target_lang}
 
     try:
         data = json.loads(structured)
     except json.JSONDecodeError:
         log_step_warning("STATS", "Could not parse structured_results as JSON")
-        return {"statistical_summary": "Could not parse structured results."}
+        return {"statistical_summary": t["parse_error"], "language": target_lang}
 
-    lines: list[str] = ["## Statistical Analysis (Python-computed)\n"]
+    lines: list[str] = [t["title"]]
 
-    # ── Metadata ─────────────────────────────────────────────────────
     metadata = data.get("metadata", {})
     if metadata:
-        lines.append("### Experiment Metadata")
+        lines.append(t["metadata"])
         for k, v in metadata.items():
             lines.append(f"- **{k}**: {v}")
         lines.append("")
 
-    # ── Methodology note ─────────────────────────────────────────────
     methodology_note = metadata.get("methodology_note", "")
     if methodology_note:
-        lines.append(f"> **Methodology note:** {methodology_note}\n")
+        lines.append(f"> **{t['methodology_note']}:** {methodology_note}\n")
 
-    # ── Simulation-computed summary ───────────────────────────────────
     sim_summary = data.get("summary", {})
     if sim_summary:
-        lines.append("### Simulation-Computed Summary")
+        lines.append(t["sim_summary"])
         for k, v in sim_summary.items():
             if isinstance(v, float):
                 lines.append(f"- **{k}**: {v:.4f}")
@@ -1030,8 +1952,7 @@ def stats_node(state: SimulationState) -> SimulationState:
                 lines.append(f"- **{k}**: {v}")
         lines.append("")
 
-    # ── Per-metric statistics from outcomes lists ─────────────────────
-    outcomes = data.get("outcomes", {})
+    outcomes = data.get("outcomes", {}) #per metric summary statistic 
     if isinstance(outcomes, dict):
         computed_any = False
         for metric, values in outcomes.items():
@@ -1056,42 +1977,49 @@ def stats_node(state: SimulationState) -> SimulationState:
                 p90 = sorted_nums[min(n - 1, int(0.90 * n))]
 
                 lines.append(f"### {metric.replace('_', ' ').title()} (n={n})")
-                lines.append("| Statistic | Value |")
+                lines.append(f"| {t['statistic']} | {t['value']} |")
                 lines.append("|-----------|-------|")
-                lines.append(f"| Mean      | {mean_v:.4f} |")
-                lines.append(f"| Median    | {median_v:.4f} |")
-                lines.append(f"| Std Dev   | {std_v:.4f} |")
-                lines.append(f"| Min       | {min_v:.4f} |")
-                lines.append(f"| Max       | {max_v:.4f} |")
-                lines.append(f"| P10       | {p10:.4f} |")
-                lines.append(f"| P25       | {p25:.4f} |")
-                lines.append(f"| P75       | {p75:.4f} |")
-                lines.append(f"| P90       | {p90:.4f} |")
+                lines.append(f"| {t['mean']}      | {mean_v:.4f} |")
+                lines.append(f"| {t['median']}    | {median_v:.4f} |")
+                lines.append(f"| {t['std_dev']}   | {std_v:.4f} |")
+                lines.append(f"| {t['min']}       | {min_v:.4f} |")
+                lines.append(f"| {t['max']}       | {max_v:.4f} |")
+                lines.append(f"| {t['p10']}       | {p10:.4f} |")
+                lines.append(f"| {t['p25']}       | {p25:.4f} |")
+                lines.append(f"| {t['p75']}       | {p75:.4f} |")
+                lines.append(f"| {t['p90']}       | {p90:.4f} |")
 
-                # Binary success/failure probability
-                unique = set(nums)
+                unique = set(nums) # Binary success/failure probability
                 if unique.issubset({0, 1, 0.0, 1.0}):
                     prob_success = mean_v
-                    lines.append(f"| P(success) | {prob_success:.1%} |")
-                    lines.append(f"| P(failure) | {1 - prob_success:.1%} |")
-
-                lines.append("")
+                    k_success = sum(1 for x in nums if x == 1 or x == 1.0)
+                    se = (prob_success * (1 - prob_success) / n) ** 0.5 if n > 0 else 0.0
+                    margin_95 = 1.96 * se
+                    ci_lower = max(0.0, prob_success - margin_95)
+                    ci_upper = min(1.0, prob_success + margin_95)
+                    lines.append(f"| {t['p_success']} | {prob_success:.1%} ({k_success}/{n} runs) |")
+                    lines.append(f"| {t['p_failure']} | {1 - prob_success:.1%} ({n - k_success}/{n} runs) |")
+                    lines.append(f"| {t.get('dist_type', 'Distribution Type')} | Bernoulli (Binary 0/1) |")
+                    lines.append(f"| {t.get('prop_se', 'Prop. Std Error (SE)')} | ±{se:.4f} (±{se:.2%}) |")
+                    lines.append(f"| {t.get('ci_95', 'Monte Carlo 95% CI')} | [{ci_lower:.1%}, {ci_upper:.1%}] (±{margin_95:.2%}) |")
+                    lines.append("")
+                    lines.append(f"> *{t.get('bernoulli_note', 'Note: Binary Bernoulli variable. Std Dev is discrete trial variance, NOT a forecast prediction interval.')}*")
+                    lines.append(f"> *{t.get('ci_note', 'Note: The 95% confidence interval reflects ONLY Monte Carlo numerical sampling uncertainty from the trial count (±1.96*SE), NOT a real-world predictive interval.')}*")
             except Exception as e:
                 log_step_progress(f"Stats failed for '{metric}': {e}")
 
         if not computed_any:
-            lines.append("*No numeric list metrics found in outcomes block.*\n")
+            lines.append(t["no_numeric"])
 
-    # ── Constraint violation probabilities ────────────────────────────
-    constraint_violations = data.get("constraint_violations", {})
-    if isinstance(constraint_violations, dict) and constraint_violations:
-        lines.append("### Constraint Violation Analysis (Python-computed)")
-        lines.append("| Constraint | Mean Violations/Run | P(≥1 violation) | Max Violations |")
-        lines.append("|------------|--------------------:|----------------:|---------------:|")
-        for constraint_name, violation_counts in constraint_violations.items():
-            if not isinstance(violation_counts, list) or len(violation_counts) == 0:
+    ca = data.get("constraint_application") or data.get("constraint_violations", {}) #constraint application
+    if isinstance(ca, dict) and ca:
+        lines.append(t["ca_header"])
+        lines.append(f"| {t['ca_constraint']} | {t['ca_mean_blocked']} | {t['ca_prob_blocked']} | {t['ca_max_blocked']} |")
+        lines.append("|------------|-----------------:|--------------:|------------:|")
+        for constraint_name, counts in ca.items():
+            if not isinstance(counts, list) or len(counts) == 0:
                 continue
-            nums = [x for x in violation_counts if isinstance(x, (int, float))]
+            nums = [x for x in counts if isinstance(x, (int, float))]
             if not nums:
                 continue
             mean_v = _stats.mean(nums)
@@ -1102,8 +2030,7 @@ def stats_node(state: SimulationState) -> SimulationState:
             )
         lines.append("")
 
-    # ── Event frequency statistics ────────────────────────────────────
-    events = data.get("events", [])
+    events = data.get("events", []) #event freq statistics
     if isinstance(events, list) and events:
         event_types: dict[str, int] = {}
         for ev in events:
@@ -1111,15 +2038,14 @@ def stats_node(state: SimulationState) -> SimulationState:
                 evt = ev.get("event", "unknown")
                 event_types[evt] = event_types.get(evt, 0) + 1
         if event_types:
-            lines.append("### Event Frequency (from representative run)")
-            lines.append("| Event Type | Count |")
+            lines.append(t["events_header"])
+            lines.append(f"| {t['event_type']} | {t['count']} |")
             lines.append("|------------|------:|")
             for evt, count in sorted(event_types.items(), key=lambda x: -x[1]):
                 lines.append(f"| {evt} | {count} |")
             lines.append("")
 
-    # ── Decision frequency ────────────────────────────────────────────
-    decisions = data.get("decisions", [])
+    decisions = data.get("decisions", []) #decision frequency
     if isinstance(decisions, list) and decisions:
         decision_types: dict[str, int] = {}
         for d in decisions:
@@ -1127,17 +2053,16 @@ def stats_node(state: SimulationState) -> SimulationState:
                 dt = d.get("decision", "unknown")
                 decision_types[dt] = decision_types.get(dt, 0) + 1
         if decision_types:
-            lines.append("### Decision Frequency (from representative run)")
-            lines.append("| Decision | Count |")
+            lines.append(t["decisions_header"])
+            lines.append(f"| {t['decision']} | {t['count']} |")
             lines.append("|----------|------:|")
             for dt, count in sorted(decision_types.items(), key=lambda x: -x[1]):
                 lines.append(f"| {dt} | {count} |")
             lines.append("")
 
-    # ── Scenario comparison ───────────────────────────────────────────
-    scenario_comparison = data.get("scenario_comparison", {})
+    scenario_comparison = data.get("scenario_comparison", {}) #scenario comparison
     if isinstance(scenario_comparison, dict) and scenario_comparison:
-        lines.append("### Scenario Comparison")
+        lines.append(t["scenario_header"])
         # Collect all metric names
         all_metrics: set[str] = set()
         for sc_data in scenario_comparison.values():
@@ -1145,7 +2070,7 @@ def stats_node(state: SimulationState) -> SimulationState:
                 all_metrics.update(sc_data.keys())
         if all_metrics:
             metric_list = sorted(all_metrics)
-            header = "| Scenario | " + " | ".join(metric_list) + " |"
+            header = f"| {t['scenario']} | " + " | ".join(metric_list) + " |"
             separator = "|----------|" + "|".join(["-" * max(len(m), 6) for m in metric_list]) + "|"
             lines.append(header)
             lines.append(separator)
@@ -1158,11 +2083,35 @@ def stats_node(state: SimulationState) -> SimulationState:
                     lines.append(f"| {sc_name} | " + " | ".join(row_vals) + " |")
             lines.append("")
 
-    # ── Assumptions with provenance ───────────────────────────────────
-    assumptions = data.get("assumptions", [])
+    sensitivity = data.get("sensitivity_sweep") or data.get("sensitivity_analysis", {}) # parameter sensitivity sweep
+    if isinstance(sensitivity, dict) and sensitivity:
+        param_name = sensitivity.get("parameter", "Parameter")
+        points = sensitivity.get("points") or sensitivity.get("sweep_points", [])
+        if isinstance(points, list) and points:
+            lines.append(t["sensitivity_header"])
+            lines.append(f"| {t['sens_param']} ({param_name}) | {t['sens_rate']} |")
+            lines.append("|-----------------------------:|----------------------:|")
+            for pt in points:
+                if isinstance(pt, dict):
+                    pval = pt.get("value", pt.get("param_value", "—"))
+                    rate = pt.get("rate", pt.get("outcome_rate", "—"))
+                    pval_str = f"{pval:.2f}" if isinstance(pval, float) else str(pval)
+                    rate_str = f"{rate:.1%}" if isinstance(rate, float) else str(rate)
+                    lines.append(f"| {pval_str} | {rate_str} |")
+            lines.append("")
+        elif isinstance(points, dict) and points:
+            lines.append(t["sensitivity_header"])
+            lines.append(f"| {t['sens_param']} ({param_name}) | {t['sens_rate']} |")
+            lines.append("|-----------------------------:|----------------------:|")
+            for pval, rate in points.items():
+                rate_str = f"{rate:.1%}" if isinstance(rate, float) else str(rate)
+                lines.append(f"| {pval} | {rate_str} |")
+            lines.append("")
+
+    assumptions = data.get("assumptions", []) #assumption provenance table
     if assumptions:
-        lines.append("### Model Assumptions (from simulation — with provenance)")
-        lines.append("| Parameter | Value | Provenance | Justification |")
+        lines.append(t["assumptions_header"])
+        lines.append(f"| {t['parameter']} | {t['value']} | {t['provenance']} | {t['justification']} |")
         lines.append("|-----------|-------|------------|---------------|")
         for a in assumptions:
             if isinstance(a, dict):
@@ -1174,36 +2123,31 @@ def stats_node(state: SimulationState) -> SimulationState:
             elif isinstance(a, str):
                 lines.append(f"| — | — | ? | {a} |")
         lines.append("")
-
-    # ── Termination ───────────────────────────────────────────────────
-    term = data.get("termination_reason", "")
+ 
+    term = data.get("termination_reason", "") #termination
     if term:
-        lines.append(f"**Termination reason:** {term}\n")
+        lines.append(f"**{t['term_reason']}:** {term}\n")
 
     elapsed = time.time() - start_time
     summary_text = "\n".join(lines)
     log_step_success(
         "STATS",
         elapsed,
-        f"Statistical summary generated ({len(summary_text)} chars, "
-        f"includes constraint violation probabilities + event frequency)"
+        f"Statistical summary generated ({len(summary_text)} chars, [{target_lang}])"
     )
 
-    return {"statistical_summary": summary_text}
+    return {"statistical_summary": summary_text, "language": target_lang}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NODE 7 — ANALYST (19-section scientific report)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def analyst_node(state: SimulationState) -> SimulationState:
+def analyst_node(state: SimulationState) -> SimulationState: #node 7
     """
     Analyst: Interprets simulation results and generates a rigorous
-    19-section scientific research report.
+    20-section scientific research report.
+    The 20th section covers Bayesian hypothesis update analysis.
     """
+    target_lang = _get_language(state)
     log_step_start(
         "ANALYST",
-        f"Generating 19-section scientific report using '{settings.MODEL_NAME}'..."
+        f"Generating 20-section scientific report [{target_lang}] using '{settings.MODEL_NAME}'..."
     )
 
     statistical_summary = state.get("statistical_summary", "")
@@ -1225,10 +2169,83 @@ RESULT VALIDATOR REPORT
 {validation_report}
 """ if validation_report else ""
 
+    hypothesis_section = f"""
+--------------------------------------------------
+BAYESIAN HYPOTHESIS ANALYSIS
+(use for Section 20 — do not invent new probabilities)
+--------------------------------------------------
+{state.get('hypothesis_analysis', '')}
+""" if state.get('hypothesis_analysis') else ""
+
+    lang_instruction = f"""
+═══════════════════════════════════════════════════
+LANGUAGE REQUIREMENT (MANDATORY — HIGHEST PRIORITY)
+═══════════════════════════════════════════════════
+
+The user prompt/scenario is written in: '{target_lang}'.
+You MUST generate the ENTIRE 20-section research report in the EXACT SAME LANGUAGE as the user scenario ({target_lang}).
+- Translate all 20 section headings and contents into professional, scientific research headings in {target_lang}.
+  Example section titles:
+  If Chinese:
+    # 模拟实验分析报告
+    ## 执行摘要
+    ## 模拟目标
+    ## 初始条件
+    ## 实体与状态变量
+    ## 模型参数
+    ## 假设与参数来源
+    ## 模拟方法论
+    ## 决策策略 / 智能体行为
+    ## 模拟动态机制
+    ## 事件时间线
+    ## 统计结果
+    ## 约束应用与执行分析
+    ## 情景对比
+    ## 敏感性与不确定性分析
+    ## 核心发现
+    ## 决策分析
+    ## 局限性与未建模因素
+    ## 科学结论
+    ## 建议
+    ## 假设更新分析
+  If Spanish:
+    # Informe de Análisis del Experimento de Simulación
+    ## Resumen Ejecutivo
+    ## Objetivo de la Simulación
+    ## Condiciones Iniciales
+    ## Entidades y Variables de Estado
+    ## Parámetros del Modelo
+    ## Supuestos y Procedencia de Parámetros
+    ## Metodología de Simulación
+    ## Políticas de Decisión / Comportamientos de Agentes
+    ## Dinámica de la Simulación
+    ## Cronología de Eventos
+    ## Resultados Estadísticos
+    ## Análisis de Aplicación y Cumplimiento de Restricciones
+    ## Comparación de Escenarios
+    ## Análisis de Sensibilidad e Incertidumbre
+    ## Hallazgos Clave
+    ## Análisis de Decisiones
+    ## Limitaciones y Factores no Modelados
+    ## Conclusión Científica
+    ## Recomendaciones
+    ## Análisis de Actualización de Hipótesis
+  If French, German, Japanese, Korean, Russian, Arabic, or any other language:
+    Translate the 20 section headings and all analysis into that language accordingly.
+
+- Terminology in {target_lang}:
+  - Use the equivalent of "MODELED LEADING SCENARIO" (e.g. "模型主导情景" in Chinese, "ESCENARIO PRINCIPAL MODELADO" in Spanish), NEVER "DETERMINATION" or "定论".
+  - Use the equivalent of "most frequently successful modeled pathway" (e.g. "模型中最常成功的路径" in Chinese), NEVER "validated pathway" or "验证通过的路径".
+  - Provenance tags: use clear labels such as [USER_PROVIDED / 用户提供], [MODEL_ASSUMPTION / 模型假设], [DERIVED / 衍生计算], [SIMULATION_OUTPUT / 模拟输出], [AI_INTERPRETATION / AI解释].
+  - Clearly distinguish Bayesian posterior from simulation eligibility.
+  - Express Monte Carlo outcomes as observed success rates (e.g. "观察到的成功率: X% ± Y%").
+"""
+
     prompt = f"""
 You are the Scientific Analyst of a Universal AI Simulation Engine.
 
-Produce a rigorous, evidence-based 19-section research report.
+Produce a rigorous, evidence-based 20-section research report.
+{lang_instruction}
 
 ═══════════════════════════════════════════════════
 ABSOLUTE RULES — NEVER VIOLATE
@@ -1277,6 +2294,65 @@ ABSOLUTE RULES — NEVER VIOLATE
    Use language such as "Under the modeled assumptions..."
    NEVER present simulation outputs as real-world predictions.
 
+9. LANGUAGE PRECISION & CALIBRATED SCIENTIFIC PHRASING
+   NEVER write that a simulation "confirms", "proves", "demonstrates", or "predicts" a real-world outcome.
+   A simulation run under assumed parameters models conditional outcomes within an assumption space; it does NOT forecast reality.
+   MANDATORY PHRASING for Scientific Conclusion and Executive Summary:
+     - In Chinese: "在当前先验、似然比、行为参数及硬约束下，模拟结果倾向于 [Hx] 作为模型中的主导情景。该结果反映的是模型假设空间内的条件性结果，而非对现实关系发展的概率预测。"
+     - In English: "Under the specified priors, likelihood ratios, behavioral parameters, and hard constraints, the simulation points to [Hx] as the modeled leading scenario. This outcome reflects conditional dynamics within the model assumption space, rather than an empirical probability forecast of real-world outcomes."
+   FORBIDDEN phrasing:
+     "The simulation CONFIRMS that [X] is the most likely scenario."
+     "The simulation PROVES [X]."
+     "AI predicts that [X] has a Y% chance of happening in reality."
+   The word "confirm" is acceptable ONLY when referring to USER_PROVIDED factual evidence
+   (e.g. "the logs confirm that the laptop was connected").
+
+10. TERMINOLOGY — MODELED LEADING SCENARIO vs DETERMINATION
+    NEVER use headings or terms like "DETERMINATION", "Determination", or "Most likely attack scenario".
+    Always use:
+      "MODELED LEADING SCENARIO"
+    A simulation models conditional pathways under assumed parameters; it does NOT make a real-world determination.
+
+11. TERMINOLOGY — MOST FREQUENTLY SUCCESSFUL MODELED PATHWAY
+    NEVER use the phrase "validated pathway", "confirmed pathway", or "proven pathway".
+    Simulating a pathway does not validate it in reality.
+    Always use:
+      "most frequently successful modeled pathway"
+
+12. BLOCKED HYPOTHESIS PARAMETER CLARITY
+    If a parameter (e.g. P_MODEL_PHYSICAL_ACCESS = 0.05) belongs to a hypothesis (e.g. H3)
+    that was deterministically blocked before sampling, state explicitly in the report:
+    "P_MODEL_PHYSICAL_ACCESS = 0.05 is not evaluated because H3 is deterministically
+     blocked before sampling."
+
+13. 4-STAGE ARCHITECTURAL DISTINCTION: POSTERIOR vs. WITHIN-BRANCH SIMULATION RATE
+    In Section 20 (Hypothesis Update Analysis) and Executive Summary, explicitly distinguish:
+      Stage 1: Prior Belief P(Hi) — baseline belief [MODEL_ASSUMPTION].
+      Stage 2: Model-Assumed Likelihood Ratios (LR) — subjective weights assigned to evidence [MODEL_ASSUMPTION] (uncalibrated model levers, NOT empirical constants).
+      Stage 3: Posterior Belief P(Hi|E) — mathematical belief update [DERIVED] representing initial branch sampling weight in the model.
+      Stage 4: Within-Branch Simulation Dynamics -> Observed Pathway Rate P(Condition met | Hi modeled).
+    Clarify common reviewer questions directly:
+      - Why H2 Posterior (e.g. 58%) != H2 Simulation Success Rate (e.g. 44.3%): 58% is belief weight under assumed likelihood ratios; 44.3% is the proportion of simulated runs in which the pathway met success conditions under the code's dynamic rules.
+      - Why H3 Posterior (e.g. 10%) != H3 Simulation Observed Rate (e.g. 51.7%): 10% is the Bayesian posterior belief given observational evidence; 51.7% is the proportion of simulated trials that satisfied the outcome condition once modeled under within-branch behavioral dynamics.
+      - Bayesian Posterior vs. Simulation Eligibility: H3 can retain a non-zero Bayesian posterior (1.23%) from circumstantial evidence, yet have 0% simulation eligibility because a deterministic hard constraint blocks it from trial execution.
+
+14. BERNOULLI BINARY OUTCOME UNCERTAINTY REPORTING
+    When an outcome is a discrete 0/1 indicator (e.g. success vs failure):
+    - The standard deviation sqrt(p*(1-p)) reflects the variance of discrete Bernoulli trials across runs (e.g. Mean = 0.443, Std = 0.497).
+    - FORBIDDEN: NEVER format this as a prediction error margin or confidence interval (e.g., NEVER write "44.3% ± 49.7%" or "44.3% ± 49.7% confidence"). That misleads readers into thinking the model has a ±50% prediction error.
+    - REQUIRED format:
+      "H2 success rate: 44.3% (443/1000 simulation runs), with a Bernoulli standard deviation of 0.497 across discrete 0/1 trials (standard error of the proportion SE = ±1.57%)."
+
+15. ASSUMPTION-DRIVEN OUTCOMES & WORLDVIEW CIRCULARITY WARNING
+    In Section 14 (Limitations), Section 16 (Key Findings), and Section 18 (Scientific Conclusion):
+    - Explicitly disclose any risk of circular reasoning (assumption-driven outcomes):
+      When an outcome (e.g., successful boundary restructuring) is mathematically determined by an aggressive input assumption (e.g., boundary_defensiveness = 0.9 forcing counterpart adaptation), acknowledge that the simulation demonstrates what happens under that specific worldview, rather than discovering an independent real-world truth.
+    - State clearly: "The simulation outcome is strongly assumption-driven: the conclusion is a direct consequence of the assumed behavioral parameters and rules, rather than an empirically validated forecast."
+
+16. BEHAVIORAL LEVERS vs. PSYCHOMETRIC MEASUREMENTS
+    - Numerical parameters for human behavior (e.g., manipulation_tendency = 0.8, boundary_defensiveness = 0.9) are scenario exploration levers, NOT clinical or psychometric measurements of real people.
+    - State clearly: "These numerical behavioral parameters represent model levers for scenario testing, not objective psychometric measurements of the individuals involved."
+
 ═══════════════════════════════════════════════════
 EVIDENCE PROVIDED
 ═══════════════════════════════════════════════════
@@ -1290,7 +2366,7 @@ ORIGINAL USER SCENARIO
 SIMULATION SPECIFICATION (with provenance labels)
 --------------------------------------------------
 {state.get('simulation_spec', '')}
-{stats_section}{validation_section}
+{hypothesis_section}{stats_section}{validation_section}
 --------------------------------------------------
 GENERATED SIMULATION CODE
 --------------------------------------------------
@@ -1310,13 +2386,13 @@ EXECUTION ERRORS
 {state.get('execution_error', '')}
 
 ═══════════════════════════════════════════════════
-REPORT STRUCTURE — PRODUCE ALL 19 SECTIONS
+REPORT STRUCTURE — PRODUCE ALL 20 SECTIONS
 ═══════════════════════════════════════════════════
 
 # Simulation Experiment Analysis Report
 
 ## Executive Summary
-2–3 sentences: what was simulated, the most important finding, and the key caveat.
+2–3 sentences: what was simulated, the MODELED LEADING SCENARIO (never write 'DETERMINATION' or 'Most likely attack scenario'), the most frequently successful modeled pathway (never 'validated pathway'), and key caveats.
 
 ## Simulation Objective
 What research question does this simulation investigate?
@@ -1371,11 +2447,11 @@ Present ALL statistics from the pre-computed evidence section.
 Use tables. Do not invent new figures.
 Include: mean, median, std, P10, P25, P75, P90 for all outcome metrics.
 
-## Constraint / Failure Analysis
-Present constraint violation probabilities from the pre-computed stats.
-P(constraint violated) for each tracked constraint.
-P(budget < 0), P(ratio > threshold), P(utilization > limit), etc.
-If constraint violations were not tracked, note this as a limitation.
+## Constraint Application and Enforcement Analysis
+Present constraint application and enforcement data from the pre-computed stats.
+Report P(constraint blocked) or enforcement frequency for each tracked constraint under "constraint_application".
+Explain that hard constraints (such as physical access alibi) deterministically block incompatible branches before sampling.
+Clarify that parameters belonging to blocked branches (e.g. P_MODEL_PHYSICAL_ACCESS = 0.05) are NOT evaluated during simulation trials.
 
 ## Scenario Comparison
 If multiple strategies or scenarios were simulated:
@@ -1386,17 +2462,27 @@ If only one scenario was simulated, note this as a limitation and
 explain what alternative scenarios would be informative.
 
 ## Sensitivity and Uncertainty Analysis
-What parameters most affect the outcome?
-If sensitivity analysis was not performed:
-- Identify the top 3 parameters that would most affect results if changed.
-- Recommend what sensitivity analysis should be run.
-Note this is speculative unless the simulation actually varied parameters.
+Two dimensions of uncertainty to distinguish:
+
+**Parameter sensitivity** (what MODEL_ASSUMPTION parameters most move the result):
+- Identify the top 3 parameters that, if changed, would most shift the outcome.
+- Give a directional estimate: "Increasing p_model_exploit from 0.85 to 0.95 would likely
+  increase observed success rate by approximately X–Y percentage points."
+- Note this is speculative unless the simulation actually varied these parameters.
+
+**Scenario uncertainty** (what additional evidence would change the dominant hypothesis):
+- Identify the 1–2 pieces of evidence that, if known, would most shift the hypothesis ranking.
+- Example: "If network traffic logs showed outbound connections at 02:03 AM, this would
+  increase the browser exploit posterior and reduce the credential theft posterior."
 
 ## Key Findings
 For each finding:
 - **Observed [SIMULATION_OUTPUT]:** What the simulation directly produced (with numbers).
-- **Interpretation [AI_INTERPRETATION]:** What that observation means.
-- **Caveat:** What the finding depends on (assumptions, control policies, etc.).
+  IMPORTANT: For binary Bernoulli outcomes, express strictly as:
+  "Observed success rate: X% (k/n simulation runs), with a Bernoulli standard deviation of Y across discrete 0/1 trials (standard error of proportion SE = ±Z%)."
+  NEVER express as "X% ± Y%" or "X% ± Y% confidence/error margin".
+- **Interpretation [AI_INTERPRETATION]:** What that observation means within the model framework.
+- **Caveat:** What the finding depends on (assumptions, control policies, circularity risks).
 
 ## Decision Analysis
 For each available decision or strategy:
@@ -1408,17 +2494,24 @@ If no universally optimal strategy exists, explain why with evidence.
 
 ## Limitations and Unmodeled Factors
 Explicitly list:
+- Assumption-Driven Outcomes & Risk of Circularity: Identify if any outcome is essentially guaranteed by an aggressive input assumption (e.g. boundary defensiveness = 0.9 forcing counterpart adaptation), meaning the simulation demonstrates what follows from that specific worldview rather than discovering an empirical truth.
+- Absence of Real-World Predictive Validity: This is an assumption-driven simulation, NOT an empirically calibrated predictive model. The outputs must not be interpreted as real-world event/relationship probabilities.
+- Non-Psychometric Nature of Behavioral Parameters: Scores such as manipulation tendency = 0.8 are scenario exploration levers, NOT clinical psychometric measurements of real people.
+- Subjective Likelihood Ratios: Likelihood ratios are model assumptions (MODEL_ASSUMPTION) rather than empirically measured constants.
 - Variables not modeled
 - Simplified assumptions
 - One-time assumptions silently applied as recurring (if detected)
 - Parameters described as MODEL_ASSUMPTION that could significantly affect results
 - Methodology limitations (e.g. rule-based rather than genuinely adaptive)
 - Missing sensitivity / scenario analysis
+- Hypotheses that were acknowledged but not simulated (from the hypothesis analysis)
 
 ## Scientific Conclusion
 What does the simulation actually demonstrate?
-Use language: "Under the assumptions represented in the simulation..."
-NOT: "This will happen in reality."
+MANDATORY REQUIRED PHRASING (use the active language equivalent):
+  - In Chinese: "在当前先验、似然比、行为参数及硬约束下，模拟结果倾向于 [Hx] 作为模型中的主导情景。该结果反映的是模型假设空间内的条件性结果，而非对现实关系发展的概率预测。"
+  - In English: "Under the specified priors, likelihood ratios, behavioral parameters, and hard constraints, the simulation points to [Hx] as the modeled leading scenario. This outcome reflects conditional dynamics within the model assumption space, rather than an empirical probability forecast of real-world outcomes."
+NEVER claim the simulation "proves", "confirms", "validates", or "predicts" real-world relationship or event occurrences.
 Distinguish: simulation evidence vs real-world prediction.
 
 ## Recommendations
@@ -1428,6 +2521,55 @@ Each recommendation must:
 - State what would change the recommendation.
 If evidence is insufficient for a strong recommendation, say so explicitly.
 
+## Hypothesis Update Analysis
+This section presents the Bayesian belief updating from the BAYESIAN HYPOTHESIS ANALYSIS above.
+
+**The 4-Stage Architectural Pipeline:**
+Explicitly delineate and contrast the 4 stages:
+1. Prior Beliefs: Base rates before evidence [MODEL_ASSUMPTION].
+2. Model Likelihood Ratios (LR): Subjective likelihood multipliers [MODEL_ASSUMPTION] (uncalibrated model levers, NOT empirical constants).
+3. Posterior Beliefs: Mathematical update under assumed LR [DERIVED], representing the initial branch sampling weight in the model.
+4. Within-Branch Simulation Dynamics -> Observed Pathway Rate: Percentage of simulated runs satisfying the outcome condition once modeled under the code's dynamic rules.
+
+**Resolving Common Reviewer Apparent Discrepancies:**
+- Explain why Posterior Belief (e.g. 58%) != Simulation Success Rate (e.g. 44.3%): 58% is belief weight under assumed likelihood ratios; 44.3% is the proportion of simulated runs in which the pathway met success conditions under the code's dynamic rules.
+- Explain why Posterior Belief (e.g. 10%) != Simulation Observed Rate (e.g. 51.7%): 10% is the Bayesian posterior belief given observational evidence; 51.7% is the proportion of simulated trials that satisfied the outcome condition once modeled under within-branch behavioral dynamics.
+- Explain Bayesian Posterior vs. Simulation Eligibility: H3 can retain a non-zero Bayesian posterior (1.23%) from circumstantial evidence, yet have 0% simulation eligibility because a deterministic hard constraint blocks it from trial execution.
+
+**Prior beliefs (before evidence):**
+Present a table: Hypothesis | Prior Probability [MODEL_ASSUMPTION] | Description
+
+**Evidence applied:**
+For each piece of evidence in the evidence_log:
+- State the evidence and its provenance
+- Explain qualitatively how it shifted beliefs (which hypotheses increased/decreased)
+
+**Posterior beliefs (after all evidence):**
+Present a table: Hypothesis | Prior [MODEL_ASSUMPTION] | Posterior [DERIVED] | Simulation Eligibility | Status | Rank
+Sort by posterior probability descending.
+Note: H3 Bayesian posterior = 1.23%, but H3 simulation eligibility = 0% (deterministically blocked by alibi constraint).
+
+**Dominant hypothesis justification (MODELED LEADING SCENARIO):**
+Explain WHY the dominant hypothesis received the highest posterior.
+Cite the specific evidence items and their likelihood ratios.
+Use "MODELED LEADING SCENARIO" to describe it, and describe its execution route as the
+"most frequently successful modeled pathway" (never "validated pathway").
+
+**Clarification of Blocked Parameters:**
+State explicitly that P_MODEL_PHYSICAL_ACCESS = 0.05 is not evaluated because H3 is deterministically blocked before sampling.
+
+**Hypotheses NOT excluded:**
+For every hypothesis with posterior > 5%, state explicitly:
+"[Name] remains plausible with [X]% posterior probability.
+It was not simulated as a primary branch because [reason from simulation focus]."
+
+**Hypotheses excluded:**
+For any hypothesis listed as 'excluded', state the HARD LOGICAL IMPOSSIBILITY
+that justifies exclusion — not merely low probability.
+Do NOT say something is "ruled out" if it merely has a low posterior.
+
+**Simulation scope vs hypothesis space:**
+State clearly which hypotheses the simulation modeled and which it did not.
 ═══════════════════════════════════════════════════
 FINAL QUALITY CHECK (before writing the report)
 ═══════════════════════════════════════════════════
@@ -1444,6 +2586,13 @@ Answer YES or NO to each. If NO, fix before producing the report:
 - Are recommendations conditional on assumptions?
 - Did you avoid describing MODEL_ASSUMPTION values as empirical facts?
 - Did you avoid recalculating statistics that are already pre-computed?
+- Are Monte Carlo outcomes expressed as "observed success rate X% ± Y%" rather than "likelihood"?
+- Did Section 20 distinguish hypotheses that are low-probability from those that are excluded?
+- Did Section 20 explicitly list which hypotheses were NOT simulated?
+- Did you use "MODELED LEADING SCENARIO" instead of "DETERMINATION"?
+- Did you use "most frequently successful modeled pathway" instead of "validated pathway"?
+- Did you clarify that P_MODEL_PHYSICAL_ACCESS = 0.05 is not evaluated because H3 is deterministically blocked before sampling?
+- Did you explicitly distinguish H3 Bayesian posterior (1.23%) from H3 simulation eligibility (0%)?
 """
 
     messages = [
@@ -1464,7 +2613,7 @@ Answer YES or NO to each. If NO, fix before producing the report:
     )
 
     start_time = time.time()
-    response = llm.invoke(messages)
+    response = llm_invoke_safe(messages, node_name="ANALYST")
     elapsed = time.time() - start_time
 
     report = response.content or ""
@@ -1473,17 +2622,12 @@ Answer YES or NO to each. If NO, fix before producing the report:
     log_step_success(
         "ANALYST",
         elapsed,
-        f"19-section research report generated ({word_count} words)"
+        f"20-section research report generated ({word_count} words, [{target_lang}])"
     )
 
-    return {"analysis_report": report}
+    return {"analysis_report": report, "language": target_lang}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CONDITIONAL EDGES
-# ──────────────────────────────────────────────────────────────────────────────
-
-def should_critic_retry(state: SimulationState) -> str:
+def should_critic_retry(state: SimulationState) -> str: #conditional edges
     """
     Routes after the critic node.
     If critic rejected the code and retries remain, send back to planner.
