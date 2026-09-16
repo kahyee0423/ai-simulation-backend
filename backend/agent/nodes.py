@@ -895,22 +895,172 @@ PART 10.5 — PARAMETER SENSITIVITY SWEEP (SCIENTIFIC BEST PRACTICE)
 ═══════════════════════════════════════════════════
 
 When the simulation outcome is strongly driven by an influential MODEL_ASSUMPTION parameter
-(e.g., boundary defensiveness, threshold, exploit rate, adoption fraction):
+(e.g., arrival demand multiplier, boundary defensiveness, threshold, exploit rate, adoption fraction):
 Include a parameter sensitivity sweep in the simulation script.
-Sweep 4 to 6 values across a plausible range (e.g. [0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-with a fast sub-sample of runs (e.g. 100-200 runs per point) and output in SIMULATION_RESULTS_JSON:
+Sweep 4 to 6 values across a plausible range (e.g. [0.7, 0.8, 0.9, 1.0, 1.1, 1.2])
+by ACTUALLY RE-RUNNING the simulation function for each point (e.g. 50-100 runs per point) and output in SIMULATION_RESULTS_JSON:
   "sensitivity_sweep": {{
     "parameter": "<name_of_param>",
     "points": [
-      {{"value": 0.50, "rate": 0.21}},
-      {{"value": 0.60, "rate": 0.27}},
-      {{"value": 0.70, "rate": 0.34}},
-      {{"value": 0.80, "rate": 0.39}},
-      {{"value": 0.90, "rate": 0.44}},
-      {{"value": 1.00, "rate": 0.48}}
+      {{"value": 0.70, "rate": 0.21}},
+      {{"value": 0.80, "rate": 0.27}},
+      {{"value": 0.90, "rate": 0.34}},
+      {{"value": 1.00, "rate": 0.39}},
+      {{"value": 1.10, "rate": 0.44}},
+      {{"value": 1.20, "rate": 0.48}}
     ]
   }}
-This provides empirical sensitivity gradients proving whether the modeled outcome responds monotonically to key assumptions.
+
+STRICTLY FORBIDDEN IN SENSITIVITY SWEEPS:
+- Never generate synthetic sensitivity numbers using formulaic multiplication or random proxies like `pressure_factor = rate / 20.0; if random.random() < (0.6 + ...)`!
+- Every single point in the sensitivity sweep MUST be measured from actual simulated trials executed with that parameter value.
+- The sensitivity loop must instantiate and execute the real simulation engine for every parameter point.
+
+═══════════════════════════════════════════════════
+PART 10.6 — FIDELITY IN QUEUEING, TRAFFIC, AND PHYSICAL TIMELINES (MANDATORY)
+═══════════════════════════════════════════════════
+
+When simulating queueing, traffic signals, transportation, or physical service systems:
+
+1. DEMAND/CAPACITY REGIME & CALIBRATION (NO PERMANENT SATURATION):
+   - The volume-to-capacity ratio (v/c) MUST be calibrated to test meaningful control dynamics.
+   - DO NOT set baseline arrival demand so high (e.g. peak demand >> clearing capacity) that the intersection becomes permanently and overwhelmingly oversaturated from minute 1 through minute 480.
+     * When v/c >> 1.0 permanently, queues grow monotonically from 0 to 1,300+ vehicles, capacity constraints block in 100% of trials, and changing signal timing has near-zero leverage because green time simply serves an infinite backlog.
+     * The simulation then measures uncontrolled congestion accumulation, NOT signal-control effectiveness.
+   - MANDATORY CALIBRATION:
+     * Baseline demand should be calibrated near the critical operating envelope (e.g. v/c ≈ 0.70 to 0.92 during peak, 0.40 to 0.60 off-peak) where queue clearance is sensitive to phase allocation policies.
+     * When testing demand sensitivity, test multiple distinct operating regimes:
+       - Low demand: 0.50x (free-flow)
+       - Moderate demand: 0.75x (mild queueing, rapid clearance)
+       - Baseline / Peak: 1.00x (near capacity, queue formation during peaks)
+       - High demand: 1.25x (oversaturation onset)
+       - Extreme demand: 1.50x (gridlock accumulation)
+     * This allows observing the phase transition: Free-Flow → Moderate Congestion → Saturation → Dissipation.
+
+2. QUEUE DELAY ACCOUNTING & SENSITIVITY MONOTONICITY (PREVENT TRUNCATION PARADOX):
+   - When calculating "average waiting time" in an experiment where an unserved queue remains at the end of the simulation horizon:
+     * CRITICAL QUEUEING LAW: NEVER compute average wait time solely across COMPLETED vehicles if unserved vehicles remain trapped in queue at t = horizon!
+     * Doing so causes the classic truncation paradox: under higher demand (1.2x), vehicles that arrive late experience massive delays but are cut off before service, so they are excluded from the completed average, making wait time appear artificially to DECREASE!
+     * MANDATORY: When unserved vehicles remain at horizon end, report:
+       (a) `completed_vehicle_avg_wait`: average queue wait of served vehicles.
+       (b) `unserved_vehicle_count` and `unserved_accumulated_wait`: backlog and delay accumulated up to horizon.
+       (c) `total_system_delay`: sum of all waiting time across ALL arriving vehicles (served wait + unserved wait).
+       (d) `average_system_wait`: total_system_delay / total_arrivals.
+     * The sensitivity sweep must report `average_system_wait` or `average_queue_length` (Little's Law: W = L/λ), ensuring physical monotonicity: higher demand MUST yield higher average delay or queue length.
+
+3. METRIC SEMANTIC CORRECTNESS (QUEUE DELAY vs RESIDENCE TIME):
+   - Every individual vehicle/entity must track its own lifecycle timestamps:
+     - `arrival_time`: Timestamp when the vehicle entered the queue.
+     - `service_start_time`: Timestamp when the vehicle reached the head of the queue AND the server/green phase began serving it.
+     - `departure_time`: Timestamp when the vehicle completed crossing/service (`departure_time = service_start_time + crossing_time`).
+   - EXACT DEFINITIONS:
+     - Queue Waiting Time: `waiting_time = v.service_start_time - v.arrival_time` (pure queue delay before service).
+     - Crossing / Service Time: `service_time = v.departure_time - v.service_start_time`
+     - Total Residence Time: `residence_time = v.departure_time - v.arrival_time` (queue wait + crossing time).
+   - MANDATORY: When the user or experiment requests "average waiting time", you MUST calculate:
+     `waiting_time = v.service_start_time - v.arrival_time`
+     DO NOT calculate `v.departure_time - v.arrival_time` as waiting time — that is total residence time and erroneously inflates wait time by the vehicle's crossing duration!
+
+4. PHYSICAL SERVICE TIMELINE & SUB-MINUTE RESOLUTION:
+   - When the scenario provides sub-minute service parameters (e.g. 20–60 seconds per vehicle):
+     The simulation clock MUST operate at sub-minute resolution (e.g. in seconds or discrete events).
+     DO NOT use a crude 1-minute step loop (`for minute in range(480)`) with arbitrary caps like `discharged_count < 2`!
+   - Crossing times MUST physically govern server availability and lane capacity:
+     - Each active server/lane maintains `server_free_time` (seconds).
+     - When vehicle `v` at the front of the queue is served during a green phase:
+       ```python
+       service_start = max(v.arrival_time, current_time_sec, server_free_time_sec)
+       service_end = service_start + v.crossing_time_sec
+       if service_end <= green_phase_end_sec:
+           # Vehicle finishes crossing before phase ends
+           v.service_start_time = service_start
+           v.departure_time = service_end
+           server_free_time_sec = service_end
+           current_time_sec = service_end
+           queue.pop(0)
+           completed_vehicles.append(v)
+       else:
+           # Server/lane remains occupied or green ends before vehicle can clear
+           break
+       ```
+     - A 60-second crossing vehicle occupies the server for 60 seconds; a 20-second vehicle occupies it for 20 seconds. Crossing time directly determines throughput!
+
+5. GENUINELY ADAPTIVE CONTROLLER (STATE-ACTUATED LOGIC):
+   - The adaptive controller MUST NOT be a static cycle with small random jitter. It must dynamically inspect measurable intersection state variables:
+     * `queue_lengths`: Current vehicles queued on North/South vs. East/West approaches.
+     * `elapsed_green_sec`: Time the current phase has been continuously green.
+     * `vehicle_headway / gap`: Time since the last vehicle crossed in the active phase.
+     * `opposing_queue`: Vehicles waiting on the red approach.
+   - ACTUATED CONTROL RULES:
+     * Minimum Green (`G_min`, e.g. 10–15 s): Prevent rapid phase flickering; phase cannot terminate before `G_min`.
+     * Maximum Green (`G_max`, e.g. 60–90 s): Prevent starvation of opposing approach; phase MUST terminate if `elapsed >= G_max` and opposing queue exists.
+     * Gap-Out / Extension: While `elapsed < G_max`, extend green if vehicles are arriving / queue remains; if a gap occurs (no vehicles arriving within threshold e.g. 3–5 s) OR opposing queue exceeds current approach queue by threshold, terminate phase and switch.
+     * Fixed-Time Comparison: Fixed controller uses constant, non-adaptive timing (e.g. strictly 45s NS, 45s EW) regardless of real-time queue states.
+
+6. TIME-SERIES TIMESTEP & OBSERVATION METADATA:
+   - Explicitly declare the timestep semantics in SIMULATION_RESULTS_JSON:
+     ```python
+     "time_series_resolution": {{
+         "time_step_sec": 60,
+         "step_unit": "minute",
+         "total_observations": 480,
+         "horizon_minutes": 480
+     }}
+     ```
+   - If time_series has 480 points, declare that each point represents the snapshot at the end of that simulation minute.
+
+═══════════════════════════════════════════════════
+PART 10.7 — STOCHASTIC REPRODUCTION AND EXPERIMENTAL CONTROL (COMMON RANDOM NUMBERS & PAIRED DIFFERENCES)
+═══════════════════════════════════════════════════
+
+For comparative experiments (e.g. comparing Fixed-Time vs Adaptive Signal Control):
+
+1. COMMON STOCHASTIC ENVIRONMENT (PAIRED MONTE CARLO):
+   - DO NOT let competing strategies independently generate their own separate random arrivals, approaches, or crossing times! Doing so confounds policy differences with stochastic traffic realization variance.
+   - For each Monte Carlo run `i`, generate a single shared traffic realization:
+     ```python
+     traffic_realization = generate_traffic_realization(seed=run_seed, horizon_sec=..., peak_rate=..., offpeak_rate=...)
+     ```
+     containing all arrival timestamps, lane/approach assignments, and pre-sampled physical crossing times.
+   - Replay this EXACT realization through both policies:
+     ```python
+     sim_fixed = run_simulation(copy.deepcopy(traffic_realization), strategy="fixed")
+     sim_adaptive = run_simulation(copy.deepcopy(traffic_realization), strategy="adaptive")
+     ```
+   - Both policies experience identical traffic. Only signal phase timing and switching decisions differ.
+
+2. PAIRED DIFFERENCE & EFFECT-SIZE INFERENCE (CRUCIAL):
+   - Under Common Random Numbers, do NOT treat runs as two independent samples. Compute paired differences for each trial `i`:
+     ```python
+     delta_wait = [adaptive_waits[i] - fixed_waits[i] for i in range(num_runs)]
+     delta_queue = [adaptive_queues[i] - fixed_queues[i] for i in range(num_runs)]
+     delta_throughput = [adaptive_throughputs[i] - fixed_throughputs[i] for i in range(num_runs)]
+     ```
+   - Compute effect-size statistics in the script and include in SIMULATION_RESULTS_JSON:
+     ```python
+     "paired_comparison": {{
+         "delta_wait": delta_wait,
+         "mean_delta_wait": float(np.mean(delta_wait)),
+         "relative_delta_wait_pct": float(np.mean(delta_wait) / np.mean(fixed_waits) * 100) if np.mean(fixed_waits) else 0.0,
+         "delta_queue": delta_queue,
+         "mean_delta_queue": float(np.mean(delta_queue)),
+         "delta_throughput": delta_throughput,
+         "mean_delta_throughput": float(np.mean(delta_throughput)),
+         "paired_trial_win_rate_wait": float(sum(1 for d in delta_wait if d < 0) / num_runs)
+     }}
+     ```
+   - Report:
+     - Mean paired difference: e.g. -15.48 s
+     - Relative percentage difference: e.g. -0.133%
+     - 95% confidence interval of the paired difference: `mean_delta ± 1.96 * (std_delta / sqrt(n))`
+     - Paired trial win rate: fraction of runs where Adaptive strictly outperformed Fixed.
+
+3. DECOUPLE BAYESIAN POSTERIORS IN ENGINEERING COMPARISONS:
+   - For comparative engineering benchmark experiments (e.g. testing control algorithms), report empirical simulation outcomes directly.
+   - Clear distinction:
+     * `H1 observed success rate` = fraction of simulated trials satisfying the engineering performance threshold (e.g. Adaptive wait < Fixed wait).
+     * `H1 Bayesian posterior` = epistemic belief weight updated from the scenario parser/prior/likelihood log.
+     * These are fundamentally different quantities and must NEVER be conflated in tables or conclusions.
 
 ═══════════════════════════════════════════════════
 PART 11 — MULTI-BRANCH CAUSAL MODELING
@@ -1310,6 +1460,48 @@ Review the code against ALL of the following criteria:
     - Does it use "most frequently successful modeled pathway" instead of "validated pathway"?
     - FLAG WARNING: if "DETERMINATION" or "validated pathway" appears in code prints or docstrings.
 
+19. EMERGENT_METRICS_VS_HARDCODING
+    - In queueing, service, or traffic simulations, are waiting times and delays computed from actual timestamps (e.g. current_time - arrival_time)?
+    - FLAG CRITICAL: if waiting times are appended as hardcoded constants (e.g. `metrics['waiting_times'].append(1.0)` or `append(0.8)`).
+    - FLAG CRITICAL: if standard deviation of waiting time is ~0 across runs when queues vary dynamically.
+
+20. FAIR_COMPARATIVE_BENCHMARKS
+    - When comparing policies/strategies (e.g. Fixed vs Adaptive signal control), do both strategies face the EXACT SAME physical universe (identical arrival processes, identical vehicle passing time distributions)?
+    - FLAG CRITICAL: if one strategy is artificially granted a faster service rate or higher clearing capacity (e.g. allowing up to 4 vehicles/min for adaptive while fixed allows 3). The physical server parameters must be identical; only the signal allocation policy can change.
+
+21. GENUINE_SIMULATION_SENSITIVITY
+    - Does the parameter sensitivity analysis re-run the simulation across parameter values?
+    - FLAG CRITICAL: if sensitivity points are computed using synthetic formulas, analytical scaling factors, random probabilities (e.g. `if random.random() < 0.6 + ...`), or mocked results without executing the real simulation engine for every parameter point.
+
+22. COMMON_RANDOM_ENVIRONMENT
+    - In comparative experiments (e.g. Fixed-Time vs Adaptive signal control), do both strategies face the EXACT SAME generated stochastic realization per run (paired Monte Carlo comparison)?
+    - FLAG CRITICAL: if comparative strategies independently generate arrivals, approaches, service times, or other physical inputs instead of replaying a shared pre-generated traffic realization per run. Policy effects must be strictly isolated using Common Random Numbers (CRN).
+
+23. METRIC_SEMANTIC_CORRECTNESS
+    - Are waiting time and delay metrics defined with correct physical/queueing semantics?
+    - FLAG CRITICAL: if "waiting time" is calculated as `departure_time - arrival_time` (which erroneously conflates queue delay with crossing/service duration). Waiting time MUST be measured as queue delay: `service_start_time - arrival_time`. Total residence time in system is `departure_time - arrival_time`.
+
+24. PHYSICAL_SERVICE_TIMELINE_AND_RESOLUTION
+    - Do sampled physical service/crossing durations (e.g. 20–60 seconds) actually govern service capacity and server availability on a realistic timeline?
+    - FLAG CRITICAL: if crossing times are sampled but ignored in discharge capacity decisions (e.g. using an arbitrary discrete limit like `discharged_count < 2` per minute while ignoring whether the sampled crossing times fit within the active green phase).
+    - FLAG CRITICAL: if a simulation with sub-minute physical service times uses a crude 1-minute time step where crossing times do not determine when the server becomes available for the next vehicle.
+
+25. DEMAND_CAPACITY_REGIME_AND_STABILITY
+    - In queueing/traffic simulations, does the baseline demand allow the system to operate near the critical operational envelope (v/c ≈ 0.70–0.92) or test distinct demand regimes (e.g. 0.5x, 0.75x, 1.0x, 1.25x)?
+    - FLAG CRITICAL: if the intersection is modeled in permanent, extreme oversaturation (demand >> capacity across all 480 minutes) where queues monotonically accumulate to 1,300+ vehicles and capacity constraints block in 100% of runs, because signal timing has negligible leverage under permanent gridlock.
+
+26. GENUINELY_ADAPTIVE_CONTROL
+    - Does the adaptive controller dynamically observe real-time state variables (queue lengths on active vs opposing approaches, elapsed green time, vehicle headway/gap) and apply actuation rules (minimum green G_min, maximum green G_max, gap-out extension or priority switching)?
+    - FLAG CRITICAL: if the "adaptive" controller is merely a fixed cycle with minor noise, rather than dynamically actuating green duration based on real-time queues.
+
+27. PAIRED_DIFFERENCE_EFFECT_SIZES
+    - In comparative experiments evaluated with Common Random Numbers (CRN), does the script record per-trial paired differences (delta = Adaptive - Fixed), compute relative effect sizes, 95% confidence intervals on paired differences, and paired win rates?
+    - FLAG WARNING: if CRN is used but results are reported only as independent group statistics without paired difference inference.
+
+28. QUEUE_DELAY_TRUNCATION_INTEGRITY
+    - When unserved vehicles remain queued at the simulation horizon end, does the model account for unserved backlog delay or report total system delay across all arriving vehicles?
+    - FLAG CRITICAL: if waiting time is calculated solely across completed vehicles in an oversaturated regime, causing the truncation paradox where higher demand artificially reduces the reported average wait time.
+
 Respond ONLY with a valid JSON object:
 {{
   "approved": true | false,
@@ -1656,6 +1848,16 @@ STATS_I18N = {
         "decision": "Decision",
         "scenario_header": "### Scenario Comparison",
         "scenario": "Scenario",
+        "paired_header": "### Paired Comparison & Effect Size Analysis (Common Random Numbers)",
+        "paired_metric": "Metric",
+        "paired_diff": "Mean Paired Diff (Δ)",
+        "paired_pct": "Relative Diff (%)",
+        "paired_ci": "Paired 95% CI",
+        "paired_win": "Adaptive Win Rate",
+        "time_series_header": "### Time-Series Observation Metadata",
+        "time_series_step": "Step Resolution",
+        "time_series_count": "Total Observations",
+        "time_series_horizon": "Horizon",
         "assumptions_header": "### Model Assumptions (from simulation — with provenance)",
         "parameter": "Parameter",
         "provenance": "Provenance",
@@ -1703,6 +1905,16 @@ STATS_I18N = {
         "decision": "决策内容",
         "scenario_header": "### 情景对比",
         "scenario": "情景名称",
+        "paired_header": "### 配对比较与效应量分析（公共随机数 CRN）",
+        "paired_metric": "指标",
+        "paired_diff": "配对差值均值 (Δ)",
+        "paired_pct": "相对差异 (%)",
+        "paired_ci": "配对 95% 置信区间",
+        "paired_win": "自适应胜率",
+        "time_series_header": "### 时间序列观测元数据",
+        "time_series_step": "时间步长",
+        "time_series_count": "观测点数量",
+        "time_series_horizon": "模拟时长",
         "assumptions_header": "### 模型假设（来自模拟 — 附来源追踪）",
         "parameter": "参数名称",
         "provenance": "来源 (Provenance)",
@@ -2062,26 +2274,91 @@ def stats_node(state: SimulationState) -> SimulationState: #node 6
 
     scenario_comparison = data.get("scenario_comparison", {}) #scenario comparison
     if isinstance(scenario_comparison, dict) and scenario_comparison:
-        lines.append(t["scenario_header"])
-        # Collect all metric names
-        all_metrics: set[str] = set()
-        for sc_data in scenario_comparison.values():
-            if isinstance(sc_data, dict):
-                all_metrics.update(sc_data.keys())
-        if all_metrics:
-            metric_list = sorted(all_metrics)
-            header = f"| {t['scenario']} | " + " | ".join(metric_list) + " |"
-            separator = "|----------|" + "|".join(["-" * max(len(m), 6) for m in metric_list]) + "|"
-            lines.append(header)
-            lines.append(separator)
-            for sc_name, sc_data in scenario_comparison.items():
+        # Separate paired_comparison if present inside scenario_comparison
+        sc_scenarios = {k: v for k, v in scenario_comparison.items() if k != "paired_comparison" and isinstance(v, dict)}
+        if sc_scenarios:
+            lines.append(t["scenario_header"])
+            # Collect all metric names
+            all_metrics: set[str] = set()
+            for sc_data in sc_scenarios.values():
                 if isinstance(sc_data, dict):
-                    row_vals = []
-                    for m in metric_list:
-                        v = sc_data.get(m, "—")
-                        row_vals.append(f"{v:.4f}" if isinstance(v, float) else str(v))
-                    lines.append(f"| {sc_name} | " + " | ".join(row_vals) + " |")
-            lines.append("")
+                    all_metrics.update(sc_data.keys())
+            if all_metrics:
+                metric_list = sorted(all_metrics)
+                header = f"| {t['scenario']} | " + " | ".join(metric_list) + " |"
+                separator = "|----------|" + "|".join(["-" * max(len(m), 6) for m in metric_list]) + "|"
+                lines.append(header)
+                lines.append(separator)
+                for sc_name, sc_data in sc_scenarios.items():
+                    if isinstance(sc_data, dict):
+                        row_vals = []
+                        for m in metric_list:
+                            v = sc_data.get(m, "—")
+                            row_vals.append(f"{v:.4f}" if isinstance(v, float) else str(v))
+                        lines.append(f"| {sc_name} | " + " | ".join(row_vals) + " |")
+                lines.append("")
+
+    # Paired Comparison & Effect Size Analysis under Common Random Numbers (CRN)
+    paired_comp = data.get("paired_comparison")
+    if not paired_comp and isinstance(scenario_comparison, dict):
+        paired_comp = scenario_comparison.get("paired_comparison")
+    
+    if isinstance(paired_comp, dict) and paired_comp:
+        lines.append(t.get("paired_header", "### Paired Comparison & Effect Size Analysis (Common Random Numbers)"))
+        lines.append(f"| {t.get('paired_metric', 'Metric')} | {t.get('paired_diff', 'Mean Paired Diff (Δ)')} | {t.get('paired_pct', 'Relative Diff (%)')} | {t.get('paired_ci', 'Paired 95% CI')} | {t.get('paired_win', 'Adaptive Win Rate')} |")
+        lines.append("|:----------------------|-----------------------:|-------------------:|----------------------:|------------------:|")
+        
+        metric_configs = [
+            ("Wait Time", ["delta_wait", "paired_delta_wait", "wait_difference"], "mean_delta_wait", "relative_delta_wait_pct", "paired_trial_win_rate_wait", " s", True),
+            ("Max Queue", ["delta_queue", "delta_max_queue", "paired_delta_queue"], "mean_delta_queue", "relative_delta_queue_pct", "paired_trial_win_rate_queue", " veh", True),
+            ("Throughput", ["delta_throughput", "paired_delta_throughput"], "mean_delta_throughput", "relative_delta_throughput_pct", "paired_trial_win_rate_throughput", " veh", False),
+        ]
+        
+        for m_label, arr_aliases, mean_key, pct_key, win_key, unit, lower_is_better in metric_configs:
+            delta_arr = None
+            for alias in arr_aliases:
+                if alias in paired_comp and isinstance(paired_comp[alias], list):
+                    delta_arr = paired_comp[alias]
+                    break
+            
+            if isinstance(delta_arr, list) and delta_arr:
+                nums = [x for x in delta_arr if isinstance(x, (int, float)) and not _is_nan(x)]
+                if nums:
+                    mean_val = _stats.mean(nums)
+                    std_val = _stats.stdev(nums) if len(nums) > 1 else 0.0
+                    se_val = std_val / math.sqrt(len(nums)) if len(nums) > 0 else 0.0
+                    ci_lo = mean_val - 1.96 * se_val
+                    ci_hi = mean_val + 1.96 * se_val
+                    
+                    pct_val = paired_comp.get(pct_key)
+                    pct_str = f"{pct_val:+.2f}%" if isinstance(pct_val, (int, float)) else "—"
+                    
+                    win_val = paired_comp.get(win_key)
+                    if win_val is not None and isinstance(win_val, (int, float)):
+                        win_rate_str = f"{win_val:.1%}"
+                    else:
+                        win_count = sum(1 for x in nums if (x < 0 if lower_is_better else x > 0))
+                        win_rate_str = f"{win_count / len(nums):.1%} ({win_count}/{len(nums)})"
+                        
+                    lines.append(f"| {m_label} | {mean_val:+.2f}{unit} | {pct_str} | [{ci_lo:+.2f}, {ci_hi:+.2f}]{unit} | {win_rate_str} |")
+        lines.append("")
+        lines.append(f"> *Note: Paired comparisons evaluate exact trial-by-trial differences (Adaptive - Fixed) under Common Random Numbers (CRN), eliminating stochastic arrival variance.*")
+        lines.append("")
+
+    # Time-Series Observation Metadata
+    ts_res = data.get("time_series_resolution", {})
+    ts_data = data.get("time_series", {})
+    if isinstance(ts_res, dict) and ts_res:
+        lines.append(t.get("time_series_header", "### Time-Series Observation Metadata"))
+        step_sec = ts_res.get("time_step_sec", "—")
+        step_unit = ts_res.get("step_unit", "second")
+        tot_obs = ts_res.get("total_observations", len(next(iter(ts_data.values()))) if isinstance(ts_data, dict) and ts_data else "—")
+        horizon = ts_res.get("horizon_minutes", "—")
+        lines.append(f"- **{t.get('time_series_step', 'Step Resolution')}**: {step_sec} s ({step_unit})")
+        lines.append(f"- **{t.get('time_series_count', 'Total Observations')}**: {tot_obs}")
+        if horizon != "—":
+            lines.append(f"- **{t.get('time_series_horizon', 'Horizon')}**: {horizon} minutes")
+        lines.append("")
 
     sensitivity = data.get("sensitivity_sweep") or data.get("sensitivity_analysis", {}) # parameter sensitivity sweep
     if isinstance(sensitivity, dict) and sensitivity:
@@ -2094,9 +2371,16 @@ def stats_node(state: SimulationState) -> SimulationState: #node 6
             for pt in points:
                 if isinstance(pt, dict):
                     pval = pt.get("value", pt.get("param_value", "—"))
-                    rate = pt.get("rate", pt.get("outcome_rate", "—"))
+                    rate = pt.get("rate", pt.get("outcome_rate", pt.get("mean_wait", pt.get("metric_value", "—"))))
                     pval_str = f"{pval:.2f}" if isinstance(pval, float) else str(pval)
-                    rate_str = f"{rate:.1%}" if isinstance(rate, float) else str(rate)
+                    if isinstance(rate, float):
+                        # Format as percentage only if it represents a probability/rate between 0 and 1
+                        if 0.0 <= rate <= 1.0 and ("rate" in pt or "probability" in pt or "prob" in str(param_name).lower()):
+                            rate_str = f"{rate:.1%}"
+                        else:
+                            rate_str = f"{rate:,.2f}"
+                    else:
+                        rate_str = str(rate)
                     lines.append(f"| {pval_str} | {rate_str} |")
             lines.append("")
         elif isinstance(points, dict) and points:
@@ -2104,7 +2388,13 @@ def stats_node(state: SimulationState) -> SimulationState: #node 6
             lines.append(f"| {t['sens_param']} ({param_name}) | {t['sens_rate']} |")
             lines.append("|-----------------------------:|----------------------:|")
             for pval, rate in points.items():
-                rate_str = f"{rate:.1%}" if isinstance(rate, float) else str(rate)
+                if isinstance(rate, float):
+                    if 0.0 <= rate <= 1.0 and ("probability" in str(param_name).lower() or "prob" in str(param_name).lower()):
+                        rate_str = f"{rate:.1%}"
+                    else:
+                        rate_str = f"{rate:,.2f}"
+                else:
+                    rate_str = str(rate)
                 lines.append(f"| {pval} | {rate_str} |")
             lines.append("")
 
@@ -2454,21 +2744,29 @@ Explain that hard constraints (such as physical access alibi) deterministically 
 Clarify that parameters belonging to blocked branches (e.g. P_MODEL_PHYSICAL_ACCESS = 0.05) are NOT evaluated during simulation trials.
 
 ## Scenario Comparison
-If multiple strategies or scenarios were simulated:
-- Present the comparison table from pre-computed stats.
-- Verify that scenarios started from identical initial conditions.
-- Flag any asymmetry in model assumptions between scenarios.
-If only one scenario was simulated, note this as a limitation and
-explain what alternative scenarios would be informative.
+If multiple strategies or scenarios were simulated (e.g. Fixed-Time vs Adaptive Signal Control):
+- Present the scenario comparison table from pre-computed stats.
+- PAIRED TRIAL INFERENCE (CRN): Present the Paired Comparison & Effect Size table:
+  * Mean paired difference (mean_delta = Adaptive - Fixed) for wait time, queue length, and throughput.
+  * Relative percentage difference (% delta).
+  * Paired 95% Confidence Interval ([mean_delta - 1.96 * SE, mean_delta + 1.96 * SE]).
+  * Paired trial win rate (fraction of runs where Adaptive outperformed Fixed).
+- Explain that Common Random Numbers (CRN) eliminate stochastic arrival realization noise by subjecting both policies to identical vehicle streams, allowing precise paired hypothesis testing.
+- If only independent group statistics were provided, explicitly note the limitation and report the paired win rate.
+- Flag any asymmetry in model assumptions between scenarios (e.g. differing service rates).
 
 ## Sensitivity and Uncertainty Analysis
 Two dimensions of uncertainty to distinguish:
 
 **Parameter sensitivity** (what MODEL_ASSUMPTION parameters most move the result):
-- Identify the top 3 parameters that, if changed, would most shift the outcome.
-- Give a directional estimate: "Increasing p_model_exploit from 0.85 to 0.95 would likely
-  increase observed success rate by approximately X–Y percentage points."
-- Note this is speculative unless the simulation actually varied these parameters.
+- Present the parameter sensitivity sweep table from pre-computed stats.
+- PHYSICAL MONOTONICITY & REGIME VALIDATION:
+  * Check whether the outcome metric behaves monotonically with parameter variation across operating regimes (e.g. Low 0.5x → Moderate 0.75x → Baseline 1.0x → High 1.25x → Extreme 1.5x).
+  * If non-monotonicity is observed (e.g. mean wait decreasing when demand increases), explicitly diagnose why:
+    (a) Queue truncation artifact: unserved vehicles with huge wait times trapped in queues at horizon end were excluded from completed averages.
+    (b) Model saturation: intersection operating in permanent oversaturation where queues accumulate without signal clearance.
+    (c) Stochastic trial variance.
+- Identify the top parameters that, if changed, would shift the decision boundary.
 
 **Scenario uncertainty** (what additional evidence would change the dominant hypothesis):
 - Identify the 1–2 pieces of evidence that, if known, would most shift the hypothesis ranking.
