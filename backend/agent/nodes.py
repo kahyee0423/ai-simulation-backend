@@ -189,6 +189,57 @@ def _strip_json_fences(raw: str) -> str:
     return s
 
 
+# ── Comparative / investigation trigger keywords ───────────────────────────────
+_HYPOTHESIS_TRIGGERS = (
+    "compare", "versus", " vs ", "vs.", "which is better", "which performs",
+    "test whether", "does x cause", "normal vs", "fat-tail", "fat tail",
+    "fixed vs", "adaptive vs", "hypothesis", "causal", "investigate whether",
+    "model comparison", "regime comparison", "scenario comparison",
+)
+
+
+def _classify_simulation_mode(state: "SimulationState") -> str:  # type: ignore[name-defined]
+    """
+    Pure-Python gate — no LLM call.
+    Returns "HYPOTHESIS" when the prompt explicitly requests comparative or
+    causal investigation; returns "DIRECT_MC" for all other prompts.
+
+    Decision order:
+      1. Explicit simulation_mode already in state (carry-through on retry).
+      2. Keyword scan of user_prompt.
+      3. hypothesis_analysis.multi_branch_required == true AND >=2 hypotheses
+         with posterior > 15%  (strong multi-branch signal from updater).
+      4. Default → DIRECT_MC.
+    """
+    # 1. Carry-through on retry
+    existing = state.get("simulation_mode", "")
+    if existing in ("DIRECT_MC", "HYPOTHESIS"):
+        return existing
+
+    # 2. Keyword scan
+    prompt_lower = state.get("user_prompt", "").lower()
+    if any(kw in prompt_lower for kw in _HYPOTHESIS_TRIGGERS):
+        return "HYPOTHESIS"
+
+    # 3. Hypothesis analysis signal
+    hyp_str = state.get("hypothesis_analysis", "")
+    if hyp_str:
+        try:
+            hyp = json.loads(hyp_str)
+            if hyp.get("multi_branch_required") is True:
+                high_posterior = [
+                    h for h in hyp.get("hypotheses", [])
+                    if isinstance(h.get("posterior"), (int, float))
+                    and h["posterior"] > 0.15
+                ]
+                if len(high_posterior) >= 2:
+                    return "HYPOTHESIS"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return "DIRECT_MC"
+
+
 def scenario_parser_node(state: SimulationState) -> SimulationState: #node 1a
     """
     Scenario Parser: Converts the natural-language user prompt into a
@@ -272,6 +323,12 @@ IMPORTANT RULES:
   with their own state, observations, objectives, and decision policies.
 - competing_hypotheses: list ALL plausible causal explanations for the scenario outcome,
   not just the most likely one. The hypothesis updater will rank them.
+- simulation_mode: output exactly ONE of the two tokens:
+  * "HYPOTHESIS" — the user is explicitly requesting comparative or causal investigation
+    (e.g. "compare X vs Y", "test whether", "normal vs fat-tail", "which strategy is better").
+  * "DIRECT_MC"  — the user wants a direct simulation of specified parameters
+    (e.g. "simulate a portfolio", "model an epidemic", "run a queueing simulation").
+  When in doubt, default to "DIRECT_MC".
 """
 
     messages = [
@@ -315,7 +372,17 @@ IMPORTANT RULES:
         )
         spec_str = raw
 
-    return {"simulation_spec": spec_str, "language": target_lang}
+    # Extract and persist simulation_mode from spec
+    sim_mode = "DIRECT_MC"
+    try:
+        spec_obj2 = json.loads(spec_str)
+        raw_mode = spec_obj2.get("simulation_mode", "")
+        if raw_mode in ("DIRECT_MC", "HYPOTHESIS"):
+            sim_mode = raw_mode
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    return {"simulation_spec": spec_str, "simulation_mode": sim_mode, "language": target_lang}
 
 def hypothesis_updater_node(state: SimulationState) -> SimulationState: #node 1b (hypothesis updater - bayesian belief table)
     """
@@ -334,6 +401,31 @@ def hypothesis_updater_node(state: SimulationState) -> SimulationState: #node 1b
     while still acknowledging secondary hypotheses and their probabilities.
     """
     target_lang = _get_language(state)
+    sim_mode = _classify_simulation_mode(state)
+
+    if sim_mode == "DIRECT_MC":
+        log_step_start("HYPOTHESIS UPDATER", f"Evaluating simulation mode [{target_lang}]...")
+        log_step_success(
+            "HYPOTHESIS UPDATER",
+            0.0,
+            "DIRECT_MC mode active — bypassing Bayesian hypothesis update (no competing hypotheses requested)"
+        )
+        analysis_dict = {
+            "status": "bypassed",
+            "reason": "No competing hypotheses were requested. The simulation uses the direct production-line/system model specified by the user.",
+            "hypotheses": [],
+            "dominant_hypothesis": None,
+            "dominant_hypothesis_name": None,
+            "dominant_posterior": 0.0,
+            "secondary_hypotheses": [],
+            "excluded_hypotheses": [],
+            "simulation_focus": "Direct Monte Carlo execution of user-specified parameters and operational rules.",
+            "multi_branch_required": False,
+            "multi_branch_reason": "Direct simulation; no branching requested.",
+            "evidence_log": []
+        }
+        return {"hypothesis_analysis": json.dumps(analysis_dict), "language": target_lang}
+
     log_step_start(
         "HYPOTHESIS UPDATER",
         f"Performing Bayesian hypothesis updating [{target_lang}] using '{settings.MODEL_NAME}'..."
@@ -556,6 +648,7 @@ MODEL CRITIC FEEDBACK — address ALL points listed
 """
 
     num_runs = _get_num_runs(spec)
+    sim_mode = _classify_simulation_mode(state)
 
     lang_instruction = f"""
 ═══════════════════════════════════════════════════
@@ -568,16 +661,74 @@ The user scenario is written in '{target_lang}'.
 3. In SIMULATION_RESULTS_JSON: Keep keys in English, but write all human-readable string values (such as methodology_note, assumption justifications, event descriptions, decision descriptions, termination_reason) in {target_lang}.
 """
 
+    # ── Mode gate: Parts 11 & 13 are only included in HYPOTHESIS mode ─────────
+    if sim_mode == "DIRECT_MC":
+        mode_gate_block = """
+═══════════════════════════════════════════════════
+PART 0 — SIMULATION MODE GATE (READ FIRST)
+═══════════════════════════════════════════════════
+
+SIMULATION MODE: DIRECT_MC
+
+The user asked for a DIRECT simulation — not a hypothesis comparison.
+This means:
+
+■ DO NOT generate branch_weights, active_branch, or np.random.choice(["H1","H2",...])
+■ DO NOT generate h1_success_flags, h2_success_flags, or any per-branch flag arrays
+■ DO NOT use Bayesian posteriors to drive simulation sampling probabilities
+■ The hypothesis belief table (if provided) is EPISTEMIC BACKGROUND ONLY.
+  It must NOT alter any simulation parameter, distribution, or sampling rule.
+■ Write a clean, faithful Monte Carlo simulation of EXACTLY what the user specified.
+■ All results are reported as plain empirical statistics (mean, median, percentiles, etc.).
+■ Parts 11 and 13 of this prompt do NOT apply in DIRECT_MC mode — skip them entirely.
+
+CORRECT DIRECT_MC PATTERN (portfolio example):
+  for run in range(num_runs):
+      value = initial_value
+      for year in range(horizon):
+          r_stock = rng.normal(stock_mean, stock_vol)
+          r_bond  = rng.normal(bond_mean,  bond_vol)
+          value  *= (1 + stock_alloc * r_stock + bond_alloc * r_bond)
+      final_values.append(value)
+  # Report: median, p5, p95, P(final < initial)
+
+FORBIDDEN IN DIRECT_MC (these indicate mode contamination):
+  branch_weights = [posterior_H1, posterior_H2]          # FORBIDDEN
+  active_branch  = np.random.choice(["H1","H2"], p=...) # FORBIDDEN
+  h1_success_flags.append(...)                           # FORBIDDEN
+"""
+    else:  # HYPOTHESIS mode
+        mode_gate_block = """
+═══════════════════════════════════════════════════
+PART 0 — SIMULATION MODE GATE (READ FIRST)
+═══════════════════════════════════════════════════
+
+SIMULATION MODE: HYPOTHESIS
+
+The user explicitly requested a comparative or causal investigation.
+Parts 11 and 13 of this prompt APPLY IN FULL:
+■ Implement each plausible hypothesis as a separate causal branch.
+■ Branch weights MUST be derived from the Bayesian posteriors above.
+■ H1/H2 success rates MUST be computed as conditional probabilities:
+    h1_runs      = sum(1 for i in range(n) if branch[i] == "H1")
+    h1_successes = sum(1 for i in range(n) if branch[i] == "H1" and success[i])
+    h1_rate      = h1_successes / h1_runs   # conditional, NOT joint!
+  NEVER compute h1_rate = sum(h1_flags) / num_runs  — that is a joint probability.
+"""
+
+    # In DIRECT_MC suppress Parts 11 and 13 from the hypothesis_block
+    effective_hypothesis_block = hypothesis_block if sim_mode == "HYPOTHESIS" else ""
+
     prompt = f"""
 You are the Simulation Architect of a Universal AI Simulation Engine.
 
 Your task is to transform the user's scenario into a rigorous, executable,
 scientifically honest Python simulation.
 {lang_instruction}
-
+{mode_gate_block}
 USER SCENARIO:
 \"{state.get('user_prompt', '')}\"
-{spec_block}{hypothesis_block}{error_context}{critic_context}
+{spec_block}{effective_hypothesis_block}{error_context}{critic_context}
 
 ═══════════════════════════════════════════════════
 PART 1 — BEFORE WRITING CODE: IDENTIFY THE MODEL
@@ -1063,8 +1214,106 @@ For comparative experiments (e.g. comparing Fixed-Time vs Adaptive Signal Contro
      * These are fundamentally different quantities and must NEVER be conflated in tables or conclusions.
 
 ═══════════════════════════════════════════════════
-PART 11 — MULTI-BRANCH CAUSAL MODELING
+PART 10.8 — DISCRETE-EVENT & FRACTIONAL-TIME FIDELITY IN MANUFACTURING AND RELIABILITY (MANDATORY)
 ═══════════════════════════════════════════════════
+
+When simulating manufacturing lines, machine reliability, queueing networks, or equipment failure/repair:
+
+1. TRUE DISCRETE-EVENT & FRACTIONAL-TIME ADVANCEMENT (NO HOURLY INTEGER APPROXIMATIONS):
+   - STRICTLY FORBIDDEN: An hourly loop `for hour in range(horizon)` that treats whole hours as production units or deducts 1.0 from repair timers.
+   - Fractional repair times (e.g. 18 min = 0.30 h) MUST affect the actual production timeline. When a repair finishes at 0.30 h, the line resumes and produces for the remaining 0.70 h.
+   - For every interval [t_start, t_end] of duration dt = t_end - t_start:
+     1. Determine whether the production line is operational.
+     2. Calculate production over the actual elapsed interval:
+        production += dt * nominal_rate * rate_multiplier
+     3. Accumulate line downtime using the UNION of machine-unavailable intervals (see below).
+     4. Accumulate machine-specific operating exposure only during intervals where that machine is operational.
+     5. Never round, ceil, or floor repair durations to whole hours.
+
+2. OVERLAPPING REPAIRS & LINE DOWNTIME UNION (MANDATORY):
+   - If multiple machines are down at the same time, actual line downtime is the UNION of their unavailable intervals, NEVER the sum of overlapping repair durations!
+   - Example: Machine 1 is down [10.0, 10.5] and Machine 2 fails at 10.0 and is down [10.0, 10.7]. Line downtime is 0.70 hours, NOT 1.20 hours! Naively summing machine repair times artificially exaggerates downtime and contaminates loss attribution.
+
+3. PRESERVE PER-OPERATING-HOUR BERNOULLI FAILURE OPPORTUNITIES (INTERPRETATION A):
+   - The user specifies failure probability per operating hour (e.g. 2% per hour). Preserve this Bernoulli opportunity semantics without converting to an arbitrary continuous hazard rate.
+   - Machines CANNOT fail while under repair or while the line is halted!
+   - Event scheduling logic:
+     Track machine operating exposure. When an operating machine completes an operating hour (or at operating checkpoints), roll Bernoulli trial with probability p_fail.
+     If a failure occurs:
+       Sample repair duration: repair_mins = rng.lognormal(mean=np.log(repair_median_minutes), sigma=repair_lognormal_sigma)
+       repair_hours = repair_mins / 60.0
+       machine_repair_finish[m] = current_time + repair_hours
+     While any machine is under repair, the line is halted:
+       Next event time is the earliest repair completion: min(finish for finish in active_repairs).
+       Advance current_time to this completion time.
+       Accumulate line downtime by dt. All operational machines remain stopped (no operating exposure accumulates, no failures can occur).
+     When all active repairs complete, the line resumes immediately at that exact fractional timestamp!
+
+4. MACHINE OPERATING EXPOSURE & THEORETICAL BOUND:
+   - Operating exposure accumulates ONLY when the machine is operational.
+   - Theoretical upper bound on failures = NUM_MACHINES * HORIZON_HOURS * FAILURE_PROB_PER_HOUR (e.g. 5 * 720 * 0.02 = 72.0).
+   - Because machines spend time under repair, observed mean failures MUST be strictly below this upper bound.
+   - Report under "exposure" in SIMULATION_RESULTS_JSON:
+     "exposure": {{
+       "expected_upper_bound_failures": float(expected_upper_bound),
+       "mean_operating_hours": float(mean_operating_hours),
+       "mean_failures": float(mean_failures),
+       "failure_rate_per_operating_hour": float(mean_failures / mean_operating_hours) if mean_operating_hours > 0 else 0.0
+     }}
+
+5. SYMMETRIC LOSS ATTRIBUTION:
+   - Track:
+     downtime_loss = total_line_downtime_hours * NOMINAL_RATE
+     ideal_uptime_production = total_line_uptime_hours * NOMINAL_RATE
+     actual_uptime_production = sum of actual units produced during operational intervals
+     net_rate_variation_effect = actual_uptime_production - ideal_uptime_production
+   - Because production rate variation (e.g. Normal(1.0, 0.05) or Uniform(0.95, 1.05)) is symmetric around 1.0, positive variation offsets negative variation on average.
+   - In SIMULATION_RESULTS_JSON, report under "loss_attribution":
+     "loss_attribution": {{
+       "downtime_loss_units": float(np.mean(downtime_losses)),
+       "ideal_uptime_production_units": float(np.mean(ideal_uptimes)),
+       "actual_uptime_production_units": float(np.mean(actual_uptimes)),
+       "net_rate_variation_effect_units": float(np.mean(net_rate_effects))
+     }}
+
+6. INDIVIDUAL 1,000 RUNS DISTRIBUTION IN JSON (MANDATORY):
+   - The user requested "total production for each simulation".
+   - In SIMULATION_RESULTS_JSON under "outcomes", MUST include the complete raw list of all 1,000 float values:
+     "outcomes": {{
+       "total_production_distribution": [float(p) for p in total_productions],
+       "sub_target_production_flag": [int(p < 65000) for p in total_productions],
+       "probability_of_sub_target_production": float(prob_below_target)
+     }}
+   - This allows downstream statistical validation to independently compute percentiles, mean, and confidence intervals.
+
+7. TERMINOLOGY & UNCERTAINTY REPORTING:
+   - FORBIDDEN: Never use "success_flag" when referring to falling below a production target.
+   - Use "sub_target_production_flag" and "probability_of_sub_target_production".
+   - Report Monte Carlo SE and 95% Monte Carlo Confidence Interval:
+     mc_se = np.sqrt(prob_below_target * (1.0 - prob_below_target) / num_runs)
+     ci_low = max(0.0, prob_below_target - 1.96 * mc_se)
+     ci_high = min(1.0, prob_below_target + 1.96 * mc_se)
+   - Do NOT report Bernoulli standard deviation as prediction uncertainty.
+   - Clearly identify this as numerical Monte Carlo sampling uncertainty: "Monte Carlo SE = ±X.X%, 95% MC interval = [Y%, Z%]".
+
+8. SENSITIVITY SWEEP USING THE EXACT SAME EVENT KERNEL & CRN:
+   - The sensitivity analysis MUST call the EXACT SAME event-driven simulation function as the baseline model.
+   - Do NOT create a simplified hourly loop for sensitivity analysis!
+   - Use Common Random Numbers (CRN) across parameter sweeps (e.g. pass run_seed = base_seed + trial_idx or use a dedicated RNG generator per trial).
+
+9. METADATA DECLARATION & NO GLOBAL RNG:
+   - Use `rng = np.random.default_rng(seed)` throughout. DO NOT call `np.random.seed(...)`. DO NOT `import random`.
+   - In SIMULATION_RESULTS_JSON metadata:
+     "methodology": "discrete_event_monte_carlo",
+     "methodology_note": "Event-driven Monte Carlo simulation with continuous fractional-hour event timing and union line downtime.",
+     "event_time_resolution": "continuous_fractional_hours"
+
+═══════════════════════════════════════════════════
+PART 11 — MULTI-BRANCH CAUSAL MODELING (HYPOTHESIS MODE ONLY)
+═══════════════════════════════════════════════════
+
+⚠ THIS PART APPLIES ONLY IN HYPOTHESIS MODE (see Part 0).
+If simulation_mode == DIRECT_MC, skip this section entirely.
 
 If the Bayesian Hypothesis Analysis provided above identifies multiple PLAUSIBLE
 hypotheses (any hypothesis with posterior > 5%), your simulation MUST model
@@ -1196,8 +1445,12 @@ FOR HYPOTHESES THAT SURVIVE CONSTRAINT CHECKING:
   remains active and uses its own probability roll normally.
 
 ═══════════════════════════════════════════════════
-PART 13 — BAYESIAN-TO-SIMULATION PARAMETER BRIDGE
+PART 13 — BAYESIAN-TO-SIMULATION PARAMETER BRIDGE (HYPOTHESIS MODE ONLY)
 ═══════════════════════════════════════════════════
+
+⚠ THIS PART APPLIES ONLY IN HYPOTHESIS MODE (see Part 0).
+If simulation_mode == DIRECT_MC, skip this section entirely and do NOT
+use branch_weights or active_branch sampling in the simulation code.
 
 The Bayesian Hypothesis Analysis provided above contains POSTERIOR PROBABILITIES
 for each hypothesis. These posteriors MUST be used as the basis for the
@@ -1213,6 +1466,13 @@ CONCRETE RULE:
   Then simulate the full causal chain for that branch.
 
 This means the Bayesian posteriors DRIVE the simulation, not just decorate the report.
+
+CRITICAL — CONDITIONAL SUCCESS RATES (not joint):
+  H1/H2 observed success rates MUST be computed conditionally:
+    h1_runs      = sum(1 for i in range(n) if branch[i] == "H1")
+    h1_successes = sum(1 for i in range(n) if branch[i] == "H1" and success[i])
+    h1_rate      = h1_successes / max(h1_runs, 1)  # P(success | H1)
+  NEVER use: h1_rate = sum(h1_flag_array) / num_runs  — this is P(H1 ∩ success), not P(success|H1).
 
 In the SIMULATION_RESULTS_JSON, expose the bridge explicitly:
   "parameters": {{
@@ -1501,6 +1761,58 @@ Review the code against ALL of the following criteria:
 28. QUEUE_DELAY_TRUNCATION_INTEGRITY
     - When unserved vehicles remain queued at the simulation horizon end, does the model account for unserved backlog delay or report total system delay across all arriving vehicles?
     - FLAG CRITICAL: if waiting time is calculated solely across completed vehicles in an oversaturated regime, causing the truncation paradox where higher demand artificially reduces the reported average wait time.
+
+29. MODE_CONTAMINATION (DIRECT_MC guard)
+    - Check the simulation_spec metadata for "simulation_mode". If it is "DIRECT_MC" (or absent/unknown, default to DIRECT_MC):
+    - FLAG CRITICAL if the code contains ANY of the following patterns:
+        * np.random.choice(["H1", ...], p=branch_weights)
+        * active_branch = np.random.choice(...)
+        * branch_weights = [...]  (derived from posteriors)
+        * h1_success_flags  /  h2_success_flags  (per-branch flag arrays)
+      These patterns mean the planner illegitimately introduced multi-branch Bayesian
+      sampling into a direct simulation prompt, silently changing the model.
+    - FLAG CRITICAL if H1/H2 observed success rates are computed as:
+        rate = sum(flag_array) / num_runs
+      This computes P(H∩success), not the conditional P(success|H). The correct form is:
+        h1_runs = sum(1 for i in range(n) if branch[i]=="H1")
+        h1_rate = h1_successes / h1_runs
+    - If simulation_mode == "HYPOTHESIS", this check does NOT apply.
+
+30. FRACTIONAL_TIME_DISCRETE_EVENT_FIDELITY
+    - In reliability, manufacturing, or service simulations with sub-hourly service/repair times (e.g. median 30-minute repair):
+    - FLAG CRITICAL if the code does hourly bucket rounding or integer subtraction (e.g. `repair_timers[m] -= 1.0` or `repair_timer -= 1` in an hourly loop).
+    - FLAG CRITICAL if production is added as a full whole hour after a fractional repair without computing production over the exact elapsed fractional interval (`dt * nominal_rate * multiplier`).
+
+31. DOWNTIME_UNION_VS_SUM
+    - Does line downtime represent the UNION of machine-unavailable intervals?
+    - FLAG CRITICAL if line downtime naively sums overlapping machine repair durations when multiple machines are down simultaneously (e.g. counting 0.5h + 0.5h = 1.0h downtime instead of 0.5h line stoppage).
+
+32. SENSITIVITY_KERNEL_CONSISTENCY
+    - Does the parameter sensitivity analysis re-use the exact same event-driven simulation function as the baseline model?
+    - FLAG CRITICAL if the sensitivity analysis reverts to a simplified hourly approximation loop or different failure logic.
+
+33. RAW_DISTRIBUTION_IN_OUTCOMES
+    - Does `SIMULATION_RESULTS_JSON['outcomes']` contain the complete list of all 1,000 raw trial production values under `"total_production_distribution"`?
+    - FLAG CRITICAL if individual trial results are omitted and only summary scalar statistics are saved.
+
+34. TARGET_TERMINOLOGY
+    - When an outcome represents falling below a performance target (e.g., `production < 65,000`), is it clearly identified as a sub-target rate / shortfall probability?
+    - FLAG CRITICAL if falling below a production target is labelled as a "success rate" or if "success_flag" is used in the JSON outcomes. Must use `"sub_target_production_flag"`.
+
+35. LOSS_ATTRIBUTION_SYMMETRY
+    - In production and rate variation models, does the code compute net rate variation symmetrically as `actual_uptime_production - ideal_uptime_production`?
+    - FLAG CRITICAL if the code counts only negative variations (e.g. `if var_factor < 1.0: loss += NOMINAL - actual`) while ignoring positive offsets, falsely exaggerating rate variation loss.
+
+36. FAILURE_EXPOSURE_ACCOUNTING
+    - Can machines fail while under repair or while the line is stopped?
+    - FLAG CRITICAL if machines roll for failure while already in a failed or repair state, or while the line is halted. Machines can only fail during active operating hours.
+    - FLAG CRITICAL if mean failures exceed the theoretical exposure upper bound (`NUM_MACHINES * TIME_HORIZON_HOURS * FAILURE_PROB_PER_HOUR`) without justification.
+    - FLAG WARNING if machine operating exposure (`machine_operating_hours`) is not tracked.
+
+37. RNG_ARCHITECTURE_AND_TYPOS
+    - Does the code use a clean, modern RNG architecture (`rng = np.random.default_rng(seed)`) passed explicitly?
+    - FLAG WARNING if `import random` is used alongside NumPy or if global `np.random.seed` is called inside trial loops.
+    - FLAG CRITICAL if typos in percentage scaling (such as `prob * 100.1` instead of `prob * 100.0`) are found.
 
 Respond ONLY with a valid JSON object:
 {{
@@ -2141,18 +2453,7 @@ def stats_node(state: SimulationState) -> SimulationState: #node 6
         log_step_warning("STATS", "Could not parse structured_results as JSON")
         return {"statistical_summary": t["parse_error"], "language": target_lang}
 
-    lines: list[str] = [t["title"]]
-
-    metadata = data.get("metadata", {})
-    if metadata:
-        lines.append(t["metadata"])
-        for k, v in metadata.items():
-            lines.append(f"- **{k}**: {v}")
-        lines.append("")
-
-    methodology_note = metadata.get("methodology_note", "")
-    if methodology_note:
-        lines.append(f"> **{t['methodology_note']}:** {methodology_note}\n")
+    lines: list[str] = []
 
     sim_summary = data.get("summary", {})
     if sim_summary:
@@ -2188,40 +2489,83 @@ def stats_node(state: SimulationState) -> SimulationState: #node 6
                 p75 = sorted_nums[min(n - 1, int(0.75 * n))]
                 p90 = sorted_nums[min(n - 1, int(0.90 * n))]
 
+                unique = set(nums) # Check if binary 0/1 indicator
+                is_binary = unique.issubset({0, 1, 0.0, 1.0})
+
                 lines.append(f"### {metric.replace('_', ' ').title()} (n={n})")
                 lines.append(f"| {t['statistic']} | {t['value']} |")
                 lines.append("|-----------|-------|")
-                lines.append(f"| {t['mean']}      | {mean_v:.4f} |")
-                lines.append(f"| {t['median']}    | {median_v:.4f} |")
-                lines.append(f"| {t['std_dev']}   | {std_v:.4f} |")
-                lines.append(f"| {t['min']}       | {min_v:.4f} |")
-                lines.append(f"| {t['max']}       | {max_v:.4f} |")
-                lines.append(f"| {t['p10']}       | {p10:.4f} |")
-                lines.append(f"| {t['p25']}       | {p25:.4f} |")
-                lines.append(f"| {t['p75']}       | {p75:.4f} |")
-                lines.append(f"| {t['p90']}       | {p90:.4f} |")
 
-                unique = set(nums) # Binary success/failure probability
-                if unique.issubset({0, 1, 0.0, 1.0}):
-                    prob_success = mean_v
-                    k_success = sum(1 for x in nums if x == 1 or x == 1.0)
-                    se = (prob_success * (1 - prob_success) / n) ** 0.5 if n > 0 else 0.0
+                if is_binary:
+                    p_val = mean_v
+                    k_count = sum(1 for x in nums if x == 1 or x == 1.0)
+                    se = (p_val * (1 - p_val) / n) ** 0.5 if n > 0 else 0.0
                     margin_95 = 1.96 * se
-                    ci_lower = max(0.0, prob_success - margin_95)
-                    ci_upper = min(1.0, prob_success + margin_95)
-                    lines.append(f"| {t['p_success']} | {prob_success:.1%} ({k_success}/{n} runs) |")
-                    lines.append(f"| {t['p_failure']} | {1 - prob_success:.1%} ({n - k_success}/{n} runs) |")
-                    lines.append(f"| {t.get('dist_type', 'Distribution Type')} | Bernoulli (Binary 0/1) |")
-                    lines.append(f"| {t.get('prop_se', 'Prop. Std Error (SE)')} | ±{se:.4f} (±{se:.2%}) |")
+                    ci_lower = max(0.0, p_val - margin_95)
+                    ci_upper = min(1.0, p_val + margin_95)
+
+                    lower_metric = metric.lower()
+                    is_shortfall = any(kw in lower_metric for kw in ("fail", "loss", "below", "shortfall", "drop", "dip", "down", "sub_target", "breach"))
+
+                    if is_shortfall:
+                        label_primary = "Probability of Condition / Shortfall" if target_lang == "English" else ("短缺/条件发生概率" if target_lang == "Chinese" else "P(condición/déficit)")
+                        label_opposite = "Probability of Normal / Meeting Target" if target_lang == "English" else ("正常/达成目标概率" if target_lang == "Chinese" else "P(normal/meta)")
+                    else:
+                        label_primary = t.get("p_success", "P(success)")
+                        label_opposite = t.get("p_failure", "P(failure)")
+
+                    lines.append(f"| {label_primary} | {p_val:.1%} ({k_count}/{n} runs) |")
+                    lines.append(f"| {label_opposite} | {1 - p_val:.1%} ({n - k_count}/{n} runs) |")
+                    lines.append(f"| {t.get('prop_se', 'Monte Carlo Standard Error (SE)')} | ±{se:.4f} (±{se:.2%}) |")
                     lines.append(f"| {t.get('ci_95', 'Monte Carlo 95% CI')} | [{ci_lower:.1%}, {ci_upper:.1%}] (±{margin_95:.2%}) |")
                     lines.append("")
-                    lines.append(f"> *{t.get('bernoulli_note', 'Note: Binary Bernoulli variable. Std Dev is discrete trial variance, NOT a forecast prediction interval.')}*")
-                    lines.append(f"> *{t.get('ci_note', 'Note: The 95% confidence interval reflects ONLY Monte Carlo numerical sampling uncertainty from the trial count (±1.96*SE), NOT a real-world predictive interval.')}*")
+                    lines.append(f"> *Note: The 95% confidence interval reflects numerical sampling uncertainty from the trial count (±1.96*SE), NOT a real-world predictive interval.*")
+                else:
+                    lines.append(f"| {t['mean']}      | {mean_v:.4f} |")
+                    lines.append(f"| {t['median']}    | {median_v:.4f} |")
+                    lines.append(f"| {t['std_dev']}   | {std_v:.4f} |")
+                    lines.append(f"| {t['min']}       | {min_v:.4f} |")
+                    lines.append(f"| {t['max']}       | {max_v:.4f} |")
+                    lines.append(f"| {t['p10']}       | {p10:.4f} |")
+                    lines.append(f"| {t['p25']}       | {p25:.4f} |")
+                    lines.append(f"| {t['p75']}       | {p75:.4f} |")
+                    lines.append(f"| {t['p90']}       | {p90:.4f} |")
+                    lines.append("")
             except Exception as e:
                 log_step_progress(f"Stats failed for '{metric}': {e}")
 
         if not computed_any:
             lines.append(t["no_numeric"])
+
+    loss_attr = data.get("loss_attribution")
+    if isinstance(loss_attr, dict) and loss_attr:
+        lines.append("### Production Loss Attribution (Python-computed)")
+        lines.append("| Factor | Value (Units) | Description |")
+        lines.append("|--------|--------------:|-------------|")
+        if "downtime_loss_units" in loss_attr:
+            lines.append(f"| Downtime Loss | {loss_attr['downtime_loss_units']:.2f} | Production lost during complete line stoppages |")
+        if "ideal_uptime_production_units" in loss_attr:
+            lines.append(f"| Ideal Production during Uptime | {loss_attr['ideal_uptime_production_units']:.2f} | Expected production at nominal rate while operational |")
+        if "actual_uptime_production_units" in loss_attr:
+            lines.append(f"| Actual Production during Uptime | {loss_attr['actual_uptime_production_units']:.2f} | Observed production after stochastic speed variations |")
+        if "net_rate_variation_effect_units" in loss_attr:
+            lines.append(f"| Net Rate Variation Effect | {loss_attr['net_rate_variation_effect_units']:+.2f} | Net deviation from nominal rate (actual - ideal) |")
+        lines.append("")
+
+    exposure = data.get("exposure")
+    if isinstance(exposure, dict) and exposure:
+        lines.append("### Machine Operating Exposure & Reliability Audit (Python-computed)")
+        lines.append("| Metric | Value | Provenance / Standard |")
+        lines.append("|--------|------:|-----------------------|")
+        if "expected_upper_bound_failures" in exposure:
+            lines.append(f"| Theoretical Failure Exposure Upper Bound | {exposure['expected_upper_bound_failures']:.2f} | Total possible failures if 0 downtime |")
+        if "mean_operating_hours" in exposure:
+            lines.append(f"| Mean Machine Operating Exposure | {exposure['mean_operating_hours']:.2f} h | Active operating hours (excluding repair time) |")
+        if "mean_failures" in exposure:
+            lines.append(f"| Observed Mean Failures | {exposure['mean_failures']:.2f} | Actual failures during operating hours |")
+        if "failure_rate_per_operating_hour" in exposure:
+            lines.append(f"| Observed Failure Rate / Operating Hour | {exposure['failure_rate_per_operating_hour']:.4f} | Failures per machine operating hour |")
+        lines.append("")
 
     ca = data.get("constraint_application") or data.get("constraint_violations", {}) #constraint application
     if isinstance(ca, dict) and ca:
@@ -2435,10 +2779,18 @@ def analyst_node(state: SimulationState) -> SimulationState: #node 7
     The 20th section covers Bayesian hypothesis update analysis.
     """
     target_lang = _get_language(state)
-    log_step_start(
-        "ANALYST",
-        f"Generating 20-section scientific report [{target_lang}] using '{settings.MODEL_NAME}'..."
-    )
+    analyst_sim_mode = _classify_simulation_mode(state)
+
+    if analyst_sim_mode == "DIRECT_MC":
+        log_step_start(
+            "ANALYST",
+            f"Generating focused scientific report [{target_lang}] using '{settings.MODEL_NAME}'..."
+        )
+    else:
+        log_step_start(
+            "ANALYST",
+            f"Generating 20-section scientific report [{target_lang}] using '{settings.MODEL_NAME}'..."
+        )
 
     statistical_summary = state.get("statistical_summary", "")
     validation_report = state.get("validation_report", "")
@@ -2459,13 +2811,16 @@ RESULT VALIDATOR REPORT
 {validation_report}
 """ if validation_report else ""
 
-    hypothesis_section = f"""
+    # In DIRECT_MC mode, completely omit the Bayesian hypothesis block
+    hypothesis_section = ""
+    if analyst_sim_mode == "HYPOTHESIS" and state.get('hypothesis_analysis'):
+        hypothesis_section = f"""
 --------------------------------------------------
 BAYESIAN HYPOTHESIS ANALYSIS
 (use for Section 20 — do not invent new probabilities)
 --------------------------------------------------
 {state.get('hypothesis_analysis', '')}
-""" if state.get('hypothesis_analysis') else ""
+"""
 
     lang_instruction = f"""
 ═══════════════════════════════════════════════════
@@ -2531,11 +2886,279 @@ You MUST generate the ENTIRE 20-section research report in the EXACT SAME LANGUA
   - Express Monte Carlo outcomes as observed success rates (e.g. "观察到的成功率: X% ± Y%").
 """
 
+    # Determine mode for analyst report behaviour
+    analyst_sim_mode = _classify_simulation_mode(state)
+
+    # Mode-specific instructions injected into the analyst prompt
+    if analyst_sim_mode == "DIRECT_MC":
+        report_title_goal = f"Produce a rigorous, focused, high-credibility scientific research report in {target_lang}."
+        analyst_mode_block = """
+═══════════════════════════════════════════════════
+SIMULATION MODE FOR THIS REPORT: DIRECT_MC
+═══════════════════════════════════════════════════
+
+The simulation was a DIRECT Monte Carlo / Discrete-Event run — NO competing hypotheses were requested.
+Do NOT output unrequested sections such as Decision Policies, Agent Behaviors, Event Timelines, Constraint Application tables, Scenario Comparison, Decision Analysis, or Recommendations.
+Report results as plain empirical statistics without Bayesian hypothesis framing or synthetic likelihood ratios.
+"""
+        report_structure_instruction = f"""
+═══════════════════════════════════════════════════
+REPORT STRUCTURE — FOCUSED SCIENTIFIC REPORT (DIRECT SIMULATION)
+═══════════════════════════════════════════════════
+
+The simulation was a direct model run with user-specified parameters — NO competing hypotheses were requested.
+Do NOT output unrequested sections such as Decision Policies, Agent Behaviors, Event Timelines, Constraint Application tables, Scenario Comparison, Decision Analysis, Recommendations, or headings titled "Statistical Analysis (Python-computed)" or "Experiment Metadata".
+Produce ONLY the following focused, highly credible, professional scientific report in {target_lang}:
+
+# Simulation Experiment Analysis
+
+## Executive Summary
+- Concise 2–3 sentence overview: system modeled, simulation horizon and trial count, primary numerical outcomes (mean/median production, downtime, sub-target rate), and core takeaway.
+- Do NOT mention "MODELED LEADING SCENARIO" (no hypothesis competition).
+
+## Simulation Configuration
+- Parameter Table:
+  | Parameter | Value | Provenance | Description / Justification |
+  (Every parameter must have an honest provenance label: [USER_PROVIDED], [MODEL_ASSUMPTION], [DERIVED]).
+  - Explicitly explain any assumptions: e.g. repair dispersion sigma = 0.6 is a model assumption required because the user specified the median (30 min) but not the dispersion.
+
+## Methodology
+- Model classification: State the exact model type (e.g. Discrete-Event Simulation / Fractional-Time Monte Carlo).
+- Explain event advancement mechanics (continuous/fractional time tracking), machine failure/repair distribution sampling, line-stopping logic, and operating exposure tracking.
+- Highlight that repair times are tracked at exact fractional resolution (e.g. 18 min = 0.30 h line stoppage, NOT 1 whole hour), preventing integer-hour discretization bias.
+
+## Results
+Present the Python-computed numerical statistics directly from PRE-COMPUTED STATISTICAL EVIDENCE:
+### Production Performance
+- Table of empirical production statistics: Mean, Median, Standard Deviation, P5, P95.
+### Target Analysis
+- Sub-target condition: Probability of production falling below threshold (e.g. < 65,000 units).
+- State: Observed probability below target = X% (k/n runs).
+- Monte Carlo Standard Error (SE) = ±Y%.
+- 95% Monte Carlo Confidence Interval = [Lower%, Upper%].
+- Clarify that this CI reflects numerical Monte Carlo sampling uncertainty from the trial count, NOT a real-world predictive interval.
+- NEVER call this a "Success Rate".
+### Downtime Analysis
+- Table of total downtime across runs: Mean, Median, P5, P95 (in fractional hours).
+### Exposure and Failure Rates
+- Table: Theoretical Upper-Bound Failure Exposure, Mean Machine Operating Exposure (hours), Observed Mean Failures, Observed Failure Rate per Machine Operating Hour.
+- Confirm that machines do not fail during repair, so observed failures remain bounded by active operating exposure.
+
+## Production Loss Attribution
+- Present the breakdown table from Python stats:
+  | Loss Driver | Impact (Units) | Contribution / Interpretation |
+  - Complete line downtime loss (downtime_hours * nominal_rate)
+  - Ideal production during uptime (uptime_hours * nominal_rate)
+  - Actual production during uptime
+  - Net rate-variation effect (actual uptime - ideal uptime; accounting symmetrically for both positive and negative fluctuations)
+
+## Sensitivity Analysis
+- Parameter sensitivity sweep table across parameter values (e.g. failure probability or repair time).
+- Confirm monotonic behavior under Common Random Numbers (CRN).
+
+## Assumptions
+- Explicit table of all MODEL_ASSUMPTION parameters, why they were chosen, and their sensitivity impact.
+
+## Limitations
+- State unmodeled real-world factors (e.g. buffer stock between machines, preventive maintenance, operator shifts).
+- Explicitly state that results represent conditional outputs within the model assumption space, not real-world predictive forecasts.
+
+## Scientific Interpretation
+- Scientific synthesis of the findings without Bayesian jargon.
+- Epistemic note: "No competing hypotheses were requested. The simulation therefore uses the direct production-line model specified by the user."
+- Do NOT output any prior/posterior probability tables or fake likelihood ratios.
+"""
+    else:
+        report_title_goal = f"Produce a rigorous, evidence-based 20-section research report in {target_lang}."
+        analyst_mode_block = """
+═══════════════════════════════════════════════════
+SIMULATION MODE FOR THIS REPORT: HYPOTHESIS
+═══════════════════════════════════════════════════
+
+The simulation modeled competing hypotheses. Apply the full 20-section structure
+including the Bayesian 4-stage pipeline in Section 20.
+H1/H2 observed success rates shown in the report must be conditional probabilities
+P(success | Hi), not joint probabilities P(Hi ∩ success).
+"""
+        report_structure_instruction = """
+═══════════════════════════════════════════════════
+REPORT STRUCTURE — PRODUCE ALL 20 SECTIONS
+═══════════════════════════════════════════════════
+
+# Simulation Experiment Analysis Report
+
+## Executive Summary
+2–3 sentences: what was simulated, the MODELED LEADING SCENARIO (never write 'DETERMINATION' or 'Most likely attack scenario'), the most frequently successful modeled pathway (never 'validated pathway'), and key caveats.
+
+## Simulation Objective
+What research question does this simulation investigate?
+What decision is the simulation designed to inform?
+
+## Initial Conditions
+List starting state values.
+For each: label as [USER_PROVIDED], [DERIVED], or [MODEL_ASSUMPTION].
+Note any discrepancies between the declared initial conditions and what appears in the code.
+
+## Entities and State Variables
+What entities exist in the simulation?
+What state variables track their condition?
+How do state variables evolve?
+
+## Model Parameters
+Table: parameter | value | provenance | effect on simulation.
+Every parameter must have a provenance label.
+Do NOT describe MODEL_ASSUMPTION parameters as "typical" or "market" values.
+
+## Assumptions and Parameter Provenance
+Explicit table of all MODEL_ASSUMPTION parameters.
+For each: what value was chosen, why, and what effect it has on results.
+Flag any assumption that significantly constrains the outcome.
+
+## Simulation Methodology
+Accurately describe what the code actually implements.
+Do NOT call it agent-based unless the code contains observation→policy→action agents.
+If it is a rule-based stochastic simulation, say so.
+Explain: state transitions, decision rules, randomness sources, time evolution.
+
+## Decision Policies / Agent Behaviors
+What decisions are made during the simulation?
+What triggers each decision? (Give the actual threshold or condition from the code.)
+Label decision outcomes as POLICY_ENFORCED where applicable.
+Example: "When student/lecturer ratio > [threshold] [MODEL_ASSUMPTION], the
+administration hires [N] lecturers. This is a POLICY_ENFORCED outcome."
+
+## Simulation Dynamics
+How did the system evolve over the simulation horizon?
+What feedback loops exist?
+What events typically occurred in what order?
+Only discuss dynamics that are actually represented in the code.
+
+## Event Timeline
+Summarise the most significant events from the events log.
+If no event log was produced, note this as a limitation.
+Format: Time | Actor | Event | Reason
+
+## Statistical Results
+Present ALL statistics from the pre-computed evidence section.
+Use tables. Do not invent new figures.
+Include: mean, median, std, P10, P25, P75, P90 for all outcome metrics.
+
+## Constraint Application and Enforcement Analysis
+Present constraint application and enforcement data from the pre-computed stats.
+Report P(constraint blocked) or enforcement frequency for each tracked constraint under "constraint_application".
+Explain that hard constraints (such as physical access alibi) deterministically block incompatible branches before sampling.
+Clarify that parameters belonging to blocked branches (e.g. P_MODEL_PHYSICAL_ACCESS = 0.05) are NOT evaluated during simulation trials.
+
+## Scenario Comparison
+If multiple strategies or scenarios were simulated (e.g. Fixed-Time vs Adaptive Signal Control):
+- Present the scenario comparison table from pre-computed stats.
+- PAIRED TRIAL INFERENCE (CRN): Present the Paired Comparison & Effect Size table:
+  * Mean paired difference (mean_delta = Adaptive - Fixed) for wait time, queue length, and throughput.
+  * Relative percentage difference (% delta).
+  * Paired 95% Confidence Interval ([mean_delta - 1.96 * SE, mean_delta + 1.96 * SE]).
+  * Paired trial win rate (fraction of runs where Adaptive outperformed Fixed).
+- Explain that Common Random Numbers (CRN) eliminate stochastic arrival realization noise by subjecting both policies to identical vehicle streams, allowing precise paired hypothesis testing.
+- If only independent group statistics were provided, explicitly note the limitation and report the paired win rate.
+- Flag any asymmetry in model assumptions between scenarios (e.g. differing service rates).
+
+## Sensitivity and Uncertainty Analysis
+Two dimensions of uncertainty to distinguish:
+
+**Parameter sensitivity** (what MODEL_ASSUMPTION parameters most move the result):
+- Present the parameter sensitivity sweep table from pre-computed stats.
+- PHYSICAL MONOTONICITY & REGIME VALIDATION:
+  * Check whether the outcome metric behaves monotonically with parameter variation across operating regimes.
+- Identify the top parameters that, if changed, would shift the decision boundary.
+
+**Scenario uncertainty** (what additional evidence would change the dominant hypothesis):
+- Identify the 1–2 pieces of evidence that, if known, would most shift the hypothesis ranking.
+
+## Key Findings
+For each finding:
+- **Observed [SIMULATION_OUTPUT]:** What the simulation directly produced (with numbers).
+- **Interpretation [AI_INTERPRETATION]:** What that observation means within the model framework.
+- **Caveat:** What the finding depends on (assumptions, control policies, circularity risks).
+
+## Decision Analysis
+For each available decision or strategy:
+- Benefits (under the modeled assumptions)
+- Risks and downside outcomes
+- Trade-offs
+- Conditions under which it is the better choice
+If no universally optimal strategy exists, explain why with evidence.
+
+## Limitations and Unmodeled Factors
+Explicitly list:
+- Assumption-Driven Outcomes & Risk of Circularity.
+- Absence of Real-World Predictive Validity.
+- Variables not modeled.
+- Simplified assumptions.
+- Parameters described as MODEL_ASSUMPTION that could significantly affect results.
+- Methodology limitations.
+
+## Scientific Conclusion
+What does the simulation actually demonstrate?
+MANDATORY REQUIRED PHRASING (use the active language equivalent):
+  - In Chinese: "在当前先验、似然比、行为参数及硬约束下，模拟结果倾向于 [Hx] 作为模型中的主导情景。该结果反映的是模型假设空间内的条件性结果，而非对现实关系发展的概率预测。"
+  - In English: "Under the specified priors, likelihood ratios, behavioral parameters, and hard constraints, the simulation points to [Hx] as the modeled leading scenario. This outcome reflects conditional dynamics within the model assumption space, rather than an empirical probability forecast of real-world outcomes."
+NEVER claim the simulation "proves", "confirms", "validates", or "predicts" real-world relationship or event occurrences.
+
+## Recommendations
+Each recommendation must:
+- State the assumption(s) it depends on.
+- State what evidence supports it.
+- State what would change the recommendation.
+If evidence is insufficient for a strong recommendation, say so explicitly.
+
+## Hypothesis Update Analysis
+This section presents the Bayesian belief updating from the BAYESIAN HYPOTHESIS ANALYSIS above.
+
+**The 4-Stage Architectural Pipeline:**
+Explicitly delineate and contrast the 4 stages:
+1. Prior Beliefs: Base rates before evidence [MODEL_ASSUMPTION].
+2. Model Likelihood Ratios (LR): Subjective likelihood multipliers [MODEL_ASSUMPTION] (uncalibrated model levers, NOT empirical constants).
+3. Posterior Beliefs: Mathematical update under assumed LR [DERIVED], representing the initial branch sampling weight in the model.
+4. Within-Branch Simulation Dynamics -> Observed Pathway Rate: Percentage of simulated runs satisfying the outcome condition once modeled under the code's dynamic rules.
+
+**Prior beliefs (before evidence):**
+Present a table: Hypothesis | Prior Probability [MODEL_ASSUMPTION] | Description
+
+**Evidence applied:**
+For each piece of evidence in the evidence_log:
+- State the evidence and its provenance
+- Explain qualitatively how it shifted beliefs (which hypotheses increased/decreased)
+
+**Posterior beliefs (after all evidence):**
+Present a table: Hypothesis | Prior [MODEL_ASSUMPTION] | Posterior [DERIVED] | Simulation Eligibility | Status | Rank
+Sort by posterior probability descending.
+
+**Dominant hypothesis justification (MODELED LEADING SCENARIO):**
+Explain WHY the dominant hypothesis received the highest posterior.
+Cite the specific evidence items and their likelihood ratios.
+Use "MODELED LEADING SCENARIO" to describe it, and describe its execution route as the
+"most frequently successful modeled pathway" (never "validated pathway").
+
+**Clarification of Blocked Parameters:**
+State explicitly that P_MODEL_PHYSICAL_ACCESS = 0.05 is not evaluated because H3 is deterministically blocked before sampling.
+
+**Hypotheses NOT excluded:**
+For every hypothesis with posterior > 5%, state explicitly:
+"[Name] remains plausible with [X]% posterior probability.
+It was not simulated as a primary branch because [reason from simulation focus]."
+
+**Hypotheses excluded:**
+For any hypothesis listed as 'excluded', state the HARD LOGICAL IMPOSSIBILITY that justifies exclusion.
+
+**Simulation scope vs hypothesis space:**
+State clearly which hypotheses the simulation modeled and which it did not.
+"""
+
     prompt = f"""
 You are the Scientific Analyst of a Universal AI Simulation Engine.
 
-Produce a rigorous, evidence-based 20-section research report.
+{report_title_goal}
 {lang_instruction}
+{analyst_mode_block}
 
 ═══════════════════════════════════════════════════
 ABSOLUTE RULES — NEVER VIOLATE
@@ -2628,20 +3251,18 @@ ABSOLUTE RULES — NEVER VIOLATE
 
 14. BERNOULLI BINARY OUTCOME UNCERTAINTY REPORTING
     When an outcome is a discrete 0/1 indicator (e.g. success vs failure):
-    - The standard deviation sqrt(p*(1-p)) reflects the variance of discrete Bernoulli trials across runs (e.g. Mean = 0.443, Std = 0.497).
-    - FORBIDDEN: NEVER format this as a prediction error margin or confidence interval (e.g., NEVER write "44.3% ± 49.7%" or "44.3% ± 49.7% confidence"). That misleads readers into thinking the model has a ±50% prediction error.
+    - The standard deviation sqrt(p*(1-p)) reflects the variance of discrete Bernoulli trials across runs.
+    - FORBIDDEN: NEVER format this as a prediction error margin or confidence interval (e.g., NEVER write "44.3% ± 49.7%" or "44.3% ± 49.7% confidence").
     - REQUIRED format:
-      "H2 success rate: 44.3% (443/1000 simulation runs), with a Bernoulli standard deviation of 0.497 across discrete 0/1 trials (standard error of the proportion SE = ±1.57%)."
+      "Observed rate: 44.3% (443/1000 simulation runs), Monte Carlo SE = ±1.57%, 95% sampling CI = [41.2%, 47.4%]."
 
 15. ASSUMPTION-DRIVEN OUTCOMES & WORLDVIEW CIRCULARITY WARNING
-    In Section 14 (Limitations), Section 16 (Key Findings), and Section 18 (Scientific Conclusion):
-    - Explicitly disclose any risk of circular reasoning (assumption-driven outcomes):
-      When an outcome (e.g., successful boundary restructuring) is mathematically determined by an aggressive input assumption (e.g., boundary_defensiveness = 0.9 forcing counterpart adaptation), acknowledge that the simulation demonstrates what happens under that specific worldview, rather than discovering an independent real-world truth.
-    - State clearly: "The simulation outcome is strongly assumption-driven: the conclusion is a direct consequence of the assumed behavioral parameters and rules, rather than an empirically validated forecast."
+    In Limitations, Key Findings, and Scientific Conclusion:
+    - Explicitly disclose any risk of circular reasoning (assumption-driven outcomes).
+    - State clearly: "The simulation outcome is strongly assumption-driven: the conclusion is a direct consequence of the assumed parameters and rules, rather than an empirically validated forecast."
 
 16. BEHAVIORAL LEVERS vs. PSYCHOMETRIC MEASUREMENTS
-    - Numerical parameters for human behavior (e.g., manipulation_tendency = 0.8, boundary_defensiveness = 0.9) are scenario exploration levers, NOT clinical or psychometric measurements of real people.
-    - State clearly: "These numerical behavioral parameters represent model levers for scenario testing, not objective psychometric measurements of the individuals involved."
+    - Numerical parameters for human behavior are scenario exploration levers, NOT clinical or psychometric measurements.
 
 ═══════════════════════════════════════════════════
 EVIDENCE PROVIDED
@@ -2675,199 +3296,8 @@ EXECUTION ERRORS
 --------------------------------------------------
 {state.get('execution_error', '')}
 
-═══════════════════════════════════════════════════
-REPORT STRUCTURE — PRODUCE ALL 20 SECTIONS
-═══════════════════════════════════════════════════
+{report_structure_instruction}
 
-# Simulation Experiment Analysis Report
-
-## Executive Summary
-2–3 sentences: what was simulated, the MODELED LEADING SCENARIO (never write 'DETERMINATION' or 'Most likely attack scenario'), the most frequently successful modeled pathway (never 'validated pathway'), and key caveats.
-
-## Simulation Objective
-What research question does this simulation investigate?
-What decision is the simulation designed to inform?
-
-## Initial Conditions
-List starting state values.
-For each: label as [USER_PROVIDED], [DERIVED], or [MODEL_ASSUMPTION].
-Note any discrepancies between the declared initial conditions and what appears in the code.
-
-## Entities and State Variables
-What entities exist in the simulation?
-What state variables track their condition?
-How do state variables evolve?
-
-## Model Parameters
-Table: parameter | value | provenance | effect on simulation.
-Every parameter must have a provenance label.
-Do NOT describe MODEL_ASSUMPTION parameters as "typical" or "market" values.
-
-## Assumptions and Parameter Provenance
-Explicit table of all MODEL_ASSUMPTION parameters.
-For each: what value was chosen, why, and what effect it has on results.
-Flag any assumption that significantly constrains the outcome.
-
-## Simulation Methodology
-Accurately describe what the code actually implements.
-Do NOT call it agent-based unless the code contains observation→policy→action agents.
-If it is a rule-based stochastic simulation, say so.
-Explain: state transitions, decision rules, randomness sources, time evolution.
-
-## Decision Policies / Agent Behaviors
-What decisions are made during the simulation?
-What triggers each decision? (Give the actual threshold or condition from the code.)
-Label decision outcomes as POLICY_ENFORCED where applicable.
-Example: "When student/lecturer ratio > [threshold] [MODEL_ASSUMPTION], the
-administration hires [N] lecturers. This is a POLICY_ENFORCED outcome."
-
-## Simulation Dynamics
-How did the system evolve over the simulation horizon?
-What feedback loops exist?
-What events typically occurred in what order?
-Only discuss dynamics that are actually represented in the code.
-
-## Event Timeline
-Summarise the most significant events from the events log.
-If no event log was produced, note this as a limitation.
-Format: Time | Actor | Event | Reason
-
-## Statistical Results
-Present ALL statistics from the pre-computed evidence section.
-Use tables. Do not invent new figures.
-Include: mean, median, std, P10, P25, P75, P90 for all outcome metrics.
-
-## Constraint Application and Enforcement Analysis
-Present constraint application and enforcement data from the pre-computed stats.
-Report P(constraint blocked) or enforcement frequency for each tracked constraint under "constraint_application".
-Explain that hard constraints (such as physical access alibi) deterministically block incompatible branches before sampling.
-Clarify that parameters belonging to blocked branches (e.g. P_MODEL_PHYSICAL_ACCESS = 0.05) are NOT evaluated during simulation trials.
-
-## Scenario Comparison
-If multiple strategies or scenarios were simulated (e.g. Fixed-Time vs Adaptive Signal Control):
-- Present the scenario comparison table from pre-computed stats.
-- PAIRED TRIAL INFERENCE (CRN): Present the Paired Comparison & Effect Size table:
-  * Mean paired difference (mean_delta = Adaptive - Fixed) for wait time, queue length, and throughput.
-  * Relative percentage difference (% delta).
-  * Paired 95% Confidence Interval ([mean_delta - 1.96 * SE, mean_delta + 1.96 * SE]).
-  * Paired trial win rate (fraction of runs where Adaptive outperformed Fixed).
-- Explain that Common Random Numbers (CRN) eliminate stochastic arrival realization noise by subjecting both policies to identical vehicle streams, allowing precise paired hypothesis testing.
-- If only independent group statistics were provided, explicitly note the limitation and report the paired win rate.
-- Flag any asymmetry in model assumptions between scenarios (e.g. differing service rates).
-
-## Sensitivity and Uncertainty Analysis
-Two dimensions of uncertainty to distinguish:
-
-**Parameter sensitivity** (what MODEL_ASSUMPTION parameters most move the result):
-- Present the parameter sensitivity sweep table from pre-computed stats.
-- PHYSICAL MONOTONICITY & REGIME VALIDATION:
-  * Check whether the outcome metric behaves monotonically with parameter variation across operating regimes (e.g. Low 0.5x → Moderate 0.75x → Baseline 1.0x → High 1.25x → Extreme 1.5x).
-  * If non-monotonicity is observed (e.g. mean wait decreasing when demand increases), explicitly diagnose why:
-    (a) Queue truncation artifact: unserved vehicles with huge wait times trapped in queues at horizon end were excluded from completed averages.
-    (b) Model saturation: intersection operating in permanent oversaturation where queues accumulate without signal clearance.
-    (c) Stochastic trial variance.
-- Identify the top parameters that, if changed, would shift the decision boundary.
-
-**Scenario uncertainty** (what additional evidence would change the dominant hypothesis):
-- Identify the 1–2 pieces of evidence that, if known, would most shift the hypothesis ranking.
-- Example: "If network traffic logs showed outbound connections at 02:03 AM, this would
-  increase the browser exploit posterior and reduce the credential theft posterior."
-
-## Key Findings
-For each finding:
-- **Observed [SIMULATION_OUTPUT]:** What the simulation directly produced (with numbers).
-  IMPORTANT: For binary Bernoulli outcomes, express strictly as:
-  "Observed success rate: X% (k/n simulation runs), with a Bernoulli standard deviation of Y across discrete 0/1 trials (standard error of proportion SE = ±Z%)."
-  NEVER express as "X% ± Y%" or "X% ± Y% confidence/error margin".
-- **Interpretation [AI_INTERPRETATION]:** What that observation means within the model framework.
-- **Caveat:** What the finding depends on (assumptions, control policies, circularity risks).
-
-## Decision Analysis
-For each available decision or strategy:
-- Benefits (under the modeled assumptions)
-- Risks and downside outcomes
-- Trade-offs
-- Conditions under which it is the better choice
-If no universally optimal strategy exists, explain why with evidence.
-
-## Limitations and Unmodeled Factors
-Explicitly list:
-- Assumption-Driven Outcomes & Risk of Circularity: Identify if any outcome is essentially guaranteed by an aggressive input assumption (e.g. boundary defensiveness = 0.9 forcing counterpart adaptation), meaning the simulation demonstrates what follows from that specific worldview rather than discovering an empirical truth.
-- Absence of Real-World Predictive Validity: This is an assumption-driven simulation, NOT an empirically calibrated predictive model. The outputs must not be interpreted as real-world event/relationship probabilities.
-- Non-Psychometric Nature of Behavioral Parameters: Scores such as manipulation tendency = 0.8 are scenario exploration levers, NOT clinical psychometric measurements of real people.
-- Subjective Likelihood Ratios: Likelihood ratios are model assumptions (MODEL_ASSUMPTION) rather than empirically measured constants.
-- Variables not modeled
-- Simplified assumptions
-- One-time assumptions silently applied as recurring (if detected)
-- Parameters described as MODEL_ASSUMPTION that could significantly affect results
-- Methodology limitations (e.g. rule-based rather than genuinely adaptive)
-- Missing sensitivity / scenario analysis
-- Hypotheses that were acknowledged but not simulated (from the hypothesis analysis)
-
-## Scientific Conclusion
-What does the simulation actually demonstrate?
-MANDATORY REQUIRED PHRASING (use the active language equivalent):
-  - In Chinese: "在当前先验、似然比、行为参数及硬约束下，模拟结果倾向于 [Hx] 作为模型中的主导情景。该结果反映的是模型假设空间内的条件性结果，而非对现实关系发展的概率预测。"
-  - In English: "Under the specified priors, likelihood ratios, behavioral parameters, and hard constraints, the simulation points to [Hx] as the modeled leading scenario. This outcome reflects conditional dynamics within the model assumption space, rather than an empirical probability forecast of real-world outcomes."
-NEVER claim the simulation "proves", "confirms", "validates", or "predicts" real-world relationship or event occurrences.
-Distinguish: simulation evidence vs real-world prediction.
-
-## Recommendations
-Each recommendation must:
-- State the assumption(s) it depends on.
-- State what evidence supports it.
-- State what would change the recommendation.
-If evidence is insufficient for a strong recommendation, say so explicitly.
-
-## Hypothesis Update Analysis
-This section presents the Bayesian belief updating from the BAYESIAN HYPOTHESIS ANALYSIS above.
-
-**The 4-Stage Architectural Pipeline:**
-Explicitly delineate and contrast the 4 stages:
-1. Prior Beliefs: Base rates before evidence [MODEL_ASSUMPTION].
-2. Model Likelihood Ratios (LR): Subjective likelihood multipliers [MODEL_ASSUMPTION] (uncalibrated model levers, NOT empirical constants).
-3. Posterior Beliefs: Mathematical update under assumed LR [DERIVED], representing the initial branch sampling weight in the model.
-4. Within-Branch Simulation Dynamics -> Observed Pathway Rate: Percentage of simulated runs satisfying the outcome condition once modeled under the code's dynamic rules.
-
-**Resolving Common Reviewer Apparent Discrepancies:**
-- Explain why Posterior Belief (e.g. 58%) != Simulation Success Rate (e.g. 44.3%): 58% is belief weight under assumed likelihood ratios; 44.3% is the proportion of simulated runs in which the pathway met success conditions under the code's dynamic rules.
-- Explain why Posterior Belief (e.g. 10%) != Simulation Observed Rate (e.g. 51.7%): 10% is the Bayesian posterior belief given observational evidence; 51.7% is the proportion of simulated trials that satisfied the outcome condition once modeled under within-branch behavioral dynamics.
-- Explain Bayesian Posterior vs. Simulation Eligibility: H3 can retain a non-zero Bayesian posterior (1.23%) from circumstantial evidence, yet have 0% simulation eligibility because a deterministic hard constraint blocks it from trial execution.
-
-**Prior beliefs (before evidence):**
-Present a table: Hypothesis | Prior Probability [MODEL_ASSUMPTION] | Description
-
-**Evidence applied:**
-For each piece of evidence in the evidence_log:
-- State the evidence and its provenance
-- Explain qualitatively how it shifted beliefs (which hypotheses increased/decreased)
-
-**Posterior beliefs (after all evidence):**
-Present a table: Hypothesis | Prior [MODEL_ASSUMPTION] | Posterior [DERIVED] | Simulation Eligibility | Status | Rank
-Sort by posterior probability descending.
-Note: H3 Bayesian posterior = 1.23%, but H3 simulation eligibility = 0% (deterministically blocked by alibi constraint).
-
-**Dominant hypothesis justification (MODELED LEADING SCENARIO):**
-Explain WHY the dominant hypothesis received the highest posterior.
-Cite the specific evidence items and their likelihood ratios.
-Use "MODELED LEADING SCENARIO" to describe it, and describe its execution route as the
-"most frequently successful modeled pathway" (never "validated pathway").
-
-**Clarification of Blocked Parameters:**
-State explicitly that P_MODEL_PHYSICAL_ACCESS = 0.05 is not evaluated because H3 is deterministically blocked before sampling.
-
-**Hypotheses NOT excluded:**
-For every hypothesis with posterior > 5%, state explicitly:
-"[Name] remains plausible with [X]% posterior probability.
-It was not simulated as a primary branch because [reason from simulation focus]."
-
-**Hypotheses excluded:**
-For any hypothesis listed as 'excluded', state the HARD LOGICAL IMPOSSIBILITY
-that justifies exclusion — not merely low probability.
-Do NOT say something is "ruled out" if it merely has a low posterior.
-
-**Simulation scope vs hypothesis space:**
-State clearly which hypotheses the simulation modeled and which it did not.
 ═══════════════════════════════════════════════════
 FINAL QUALITY CHECK (before writing the report)
 ═══════════════════════════════════════════════════

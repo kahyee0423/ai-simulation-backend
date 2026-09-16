@@ -4,6 +4,7 @@ class SimulationState(TypedDict):
     user_prompt: str             # Natural language prompt from the user
     language: str                # Target language for simulation outputs (e.g. "Chinese", "English")
     simulation_spec: str         # Structured JSON simulation specification (with provenance)
+    simulation_mode: str         # "DIRECT_MC" | "HYPOTHESIS" — gate set by scenario_parser
     hypothesis_analysis: str     # JSON — prior/posterior belief table, dominant hypothesis, evidence log
     plan: str                    # AI-generated simulation plan (raw LLM text)
     generated_code: str          # AI-generated Python simulation script
