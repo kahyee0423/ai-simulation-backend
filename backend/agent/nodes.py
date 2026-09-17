@@ -901,14 +901,50 @@ PART 7 — MONTE CARLO REQUIREMENTS
 
 Run {num_runs} independent simulation trials.
 For each trial, record per-trial outcomes in lists.
-Include a fixed random seed: np.random.seed(42)
+Use a seeded generator per trial: `rng = np.random.default_rng(run_seed)` where `run_seed = 42 + run_idx`.
 
-Track constraint application per trial:
-```python
-constraint_application = {{
-    "<constraint_name>_constraint_blocked_flag": []  # 1 if branch was blocked by constraint this run, 0 otherwise
-}}
-```
+═══════════════════════════════════════════════════
+PART 7.1 — RIGOROUS SCIENTIFIC SIMULATION ENGINE RULES (MANDATORY)
+═══════════════════════════════════════════════════
+
+1. RNG PROPAGATION & ISOLATION (ZERO-LEAKAGE RULE):
+   - In each trial, instantiate ONE generator: `rng = np.random.default_rng(seed)`.
+   - Pass this `rng` explicitly into EVERY class constructor, entity instance, and helper function:
+     `patient = Patient(patient_id, arrival_time, rng)`
+   - FORBIDDEN: NEVER instantiate `np.random.default_rng()` without a seed inside any class or helper!
+   - FORBIDDEN: NEVER call global `np.random.*` functions (e.g. `np.random.exponential`). All random draws MUST be `rng.exponential(...)`, `rng.poisson(...)`, etc., using the passed `rng`.
+
+2. TRUE DISCRETE-EVENT SIMULATION (DES) ENGINE:
+   - When the problem involves queues, hospitals, servers, or logistics with continuous service durations, implement a TRUE EVENT-DRIVEN KERNEL using a priority queue (`heapq` or `simpy`).
+   - Advance time to the next scheduled event: `(event_time, event_type, priority, entity_id) = heapq.heappop(event_queue)`.
+   - FORBIDDEN: Do NOT advance time in a fixed 1-minute loop (`for minute in range(...)`) when service times are continuous. Fixed 1-minute time-stepping introduces systematic discretization bias.
+
+3. FINITE-HORIZON CLEARING & SURVIVORSHIP BIAS:
+   - In finite-horizon queueing/service systems (e.g. 24-hour arrival window), do NOT simply stop the simulation and calculate metrics ONLY from completed entities. That causes severe truncation/survivorship bias under congestion!
+   - EITHER implement a CLEARANCE PERIOD: stop generating new arrivals after the arrival window ends, but continue simulation until all in-system entities are served and discharged.
+   - OR explicitly track and report:
+     - `arrivals_count`: total entities generated in window
+     - `completions_count`: entities discharged
+     - `remaining_wip`: entities still waiting in queue or in service at cutoff
+     - Distinct metrics for completed cohort vs. right-censored waiting cohort.
+
+4. MULTI-STAGE METRIC DECONFOUNDING (WAITING TIMES):
+   - Never report a single omnibus "waiting time". In multi-stage processes, distinctly measure and name:
+     - `triage_wait`: arrival -> triage start
+     - `doctor_wait`: triage end -> consultation start
+     - `arrival_to_doctor_wait`: arrival -> consultation start
+     - `treatment_wait`: consultation end -> treatment start
+     - `total_time_in_system`: arrival -> discharge
+   - Clearly define each metric in the output JSON.
+
+5. EMPIRICAL CONSTRAINT-BLOCKING MEASUREMENT:
+   - FORBIDDEN: NEVER output hardcoded dummy lists (e.g. `[0] * NUM_RUNS`) for constraint blocked flags!
+   - Actively instrument constraint blocking: measure minutes and events where queues were non-empty while available resources were 0 (e.g. `doctor_blocking_minutes`, `doctor_blocking_events`, `bed_blocking_minutes`).
+
+6. HONESTY IN STATISTICAL CLAIMS:
+   - Do NOT claim "Common Random Numbers (CRN)" unless multiple alternative scenarios are simulated with synchronized random seeds. For single-scenario replications, label as "Independent Monte Carlo replications".
+   - Do NOT claim "Sensitivity Analysis" unless a formal multi-scenario parameter variation sweep is actually executed in the simulation.
+   - For all reported metrics, compute both the Replication Standard Deviation (SD) across trials AND the Monte Carlo Standard Error (MCSE = SD / sqrt(N)) with 95% Confidence Intervals.
 
 ═══════════════════════════════════════════════════
 PART 8 — MANDATORY STRUCTURED OUTPUT
@@ -1309,6 +1345,208 @@ When simulating manufacturing lines, machine reliability, queueing networks, or 
      "event_time_resolution": "continuous_fractional_hours"
 
 ═══════════════════════════════════════════════════
+PART 10.9 — MULTI-RESOURCE QUEUEING & SERVICE SYSTEMS (ED / HOSPITAL / CALL-CENTER / MULTI-STAGE QUEUE) (MANDATORY)
+═══════════════════════════════════════════════════
+
+Applies when the scenario involves patient/customer queues flowing through multiple sequential service stages with distinct resource pools (e.g. nurses, doctors, beds).
+
+1. RESOURCE-ROLE EXPLICIT DECLARATION (NO SILENT ASSUMPTIONS):
+   - Every patient-processing stage MUST declare exactly which resources it consumes and for how long.
+   - FORBIDDEN: silently binding a doctor to the treatment stage when the prompt specifies only "2 doctors, 3 nurses, 10 beds" and the treatment step does not mention doctor attendance.
+   - CORRECT default resource mapping (unless the scenario EXPLICITLY states otherwise):
+       Triage:       1 nurse occupied for triage_duration_minutes
+       Consultation: 1 doctor occupied for consultation_duration_minutes
+       Treatment:    1 bed occupied for treatment_duration_minutes  ← NO doctor, NO nurse by default
+       Discharge:    no resource consumed
+   - If the scenario EXPLICITLY says "a doctor must supervise treatment", then model it and declare:
+       "treatment_requires_doctor": {{"value": True, "provenance": "USER_PROVIDED", "note": "Scenario states doctor remains during treatment."}}
+   - If the model adds a resource requirement NOT stated in the scenario, declare it as:
+       "treatment_requires_doctor": {{"value": True, "provenance": "MODEL_ASSUMPTION", "note": "Assumed for conservative capacity estimate."}}
+   - With 2 doctors and 10 beds: tying a doctor to each bed effectively limits concurrent treatments to 2, not 10. This is a MAJOR capacity impact that must be disclosed.
+
+2. MEASUREMENT-WINDOW SEPARATION (ARRIVAL WINDOW vs DRAIN WINDOW):
+   - Define three explicit windows:
+       ARRIVAL_WINDOW:     [0, T_horizon]          → patients enter only during this period
+       PERFORMANCE_WINDOW: [0, T_horizon]          → resource utilization denominators
+       DRAIN_WINDOW:       [T_horizon, ∞)          → system drains remaining patients; NO utilization billed
+   - MANDATORY implementation pattern:
+       # Inside event loop:
+       dt_for_util = max(0.0, min(current_time, T_horizon) - max(last_time, 0.0))
+       doctor_busy_minutes  += doctors_occupied * dt_for_util
+       nurse_busy_minutes   += nurses_occupied  * dt_for_util
+       bed_busy_minutes     += beds_occupied    * dt_for_util
+   - FORBIDDEN: accumulating resource occupancy beyond T_horizon while keeping the denominator as `T_horizon × capacity`.
+   - Hard invariant enforced in code at end of each replication:
+       doctor_util = doctor_busy_minutes / (T_horizon * N_DOCTORS)
+       nurse_util  = nurse_busy_minutes  / (T_horizon * N_NURSES)
+       bed_util    = bed_busy_minutes    / (T_horizon * N_BEDS)
+       assert 0.0 <= doctor_util <= 1.0 + 1e-9, f"Doctor util OOB: {{doctor_util}}"
+       assert 0.0 <= nurse_util  <= 1.0 + 1e-9, f"Nurse util OOB: {{nurse_util}}"
+       assert 0.0 <= bed_util    <= 1.0 + 1e-9, f"Bed util OOB: {{bed_util}}"
+
+3. EXACT PIECEWISE-CONSTANT NHPP — THINNING METHOD (MANDATORY):
+   - FORBIDDEN: sampling `inter_arrival = rng.exponential(1.0 / rate_at_current_hour)` because the drawn inter-arrival can cross an hour boundary under the wrong rate.
+   - CORRECT thinning implementation:
+       lambda_max = max(HOURLY_RATES) / 60.0   # per minute
+       t = 0.0
+       while t < T_horizon:
+           t += rng.exponential(1.0 / lambda_max)  # candidate arrival time
+           if t >= T_horizon:
+               break
+           current_hour = int(t // 60)
+           lambda_t = HOURLY_RATES[min(current_hour, len(HOURLY_RATES)-1)] / 60.0
+           if rng.random() < lambda_t / lambda_max:   # accept/reject
+               arrivals.append(t)
+   - This guarantees exact NHPP generation regardless of rate boundary crossings.
+
+4. METRIC SEMANTIC PRECISION (MANDATORY STAGE-LEVEL LABELS):
+   - Every wait/delay metric must be named to reflect its exact definition:
+       arrival_to_triage_start_wait:    queue time before triage begins
+       arrival_to_consult_start_wait:   arrival → triage queue wait + triage + consult queue wait
+       arrival_to_treatment_start_wait: arrival → all pre-treatment delays
+       total_length_of_stay:            arrival to discharge (complete ED visit time)
+   - FORBIDDEN: calling `consultation_start_time - arrival_time` simply "mean patient waiting time" or "average wait" without stage qualification.
+   - The '>30 min threshold' metric must also specify which stage: e.g. "% patients with arrival-to-consultation wait > 30 min".
+   - Store all four stage metrics per patient and report means in SIMULATION_RESULTS_JSON:
+       "waiting_times": {{
+           "mean_triage_queue_wait_min":    float(...),
+           "mean_consult_queue_wait_min":   float(...),
+           "mean_treatment_queue_wait_min": float(...),
+           "mean_total_los_min":            float(...),
+           "pct_arrival_to_consult_over_30_min": float(...)
+       }}
+
+5. NO FABRICATED SENSITIVITY OR CRN CLAIMS:
+   - FORBIDDEN: writing in the report "under Common Random Numbers, queue metrics scale monotonically" unless the simulation code contains an ACTUAL parameter sweep loop.
+   - If `scenario_comparison == {{}}` or no second scenario was run, the report MUST state:
+       "Sensitivity analysis was not executed in this simulation run."
+   - Only describe sensitivity findings that correspond to executed code. Do NOT extrapolate from theoretical expectations and present them as experimental results.
+
+6. MULTI-STAGE WAITING TIME DECOMPOSITION (MANDATORY IN REPORT):
+   - Track per-patient timestamps:
+       patient.arrival_time
+       patient.triage_start_time
+       patient.triage_end_time
+       patient.consult_start_time
+       patient.consult_end_time
+       patient.treatment_start_time
+       patient.treatment_end_time  (= discharge_time)
+   - Compute per patient:
+       triage_queue_wait   = triage_start_time - arrival_time
+       consult_queue_wait  = consult_start_time - triage_end_time
+       treatment_queue_wait = treatment_start_time - consult_end_time
+       total_los           = treatment_end_time - arrival_time
+
+7. PHYSICAL INVARIANT ASSERTIONS IN CODE:
+   - Add at the END of each replication (after all events are processed):
+       assert available_doctors >= 0, f"available_doctors negative: {{available_doctors}}"
+       assert available_nurses  >= 0, f"available_nurses negative: {{available_nurses}}"
+       assert available_beds    >= 0, f"available_beds negative: {{available_beds}}"
+       assert len(completed_patients) <= total_arrivals, "completed > arrivals"
+   - These are hard failures, not warnings. If they trigger, the simulation has a logic bug.
+
+8. LOG-NORMAL MEAN PARAMETERIZATION (MANDATORY):
+   - CRITICAL BUG: Using `mu = math.log(target_mean)` then calling `rng.lognormal(mu, sigma)` gives:
+       E[X] = exp(mu + sigma^2 / 2) = target_mean * exp(sigma^2 / 2)
+     which is LARGER than target_mean. The reported and actual mean values disagree.
+   - CORRECT parameterization to achieve a desired arithmetic mean:
+       import math
+       sigma = 0.5   # (or any value)
+       target_mean = 15.0   # arithmetic mean you actually want
+       mu = math.log(target_mean) - (sigma ** 2) / 2.0
+       sample = rng.lognormal(mu, sigma)  # => E[sample] == 15.0
+   - Apply this correction to EVERY log-normal service time (triage, consultation, treatment, repair).
+   - FORBIDDEN: Using `math.log(5.0)` as mu when you want a mean of 5 minutes.
+   - Declare in SIMULATION_RESULTS_JSON parameters:
+       "triage_duration_mean_min": {{"value": target_mean, "mu_used": mu, "sigma_used": sigma, "provenance": "USER_PROVIDED"}}
+
+9. PER-STAGE QUEUE INSTRUMENTATION (MANDATORY IN MULTI-STAGE SYSTEMS):
+   - FORBIDDEN: Reporting a single aggregate `mean_queue_length = triage_queue + consult_queue + treatment_queue`.
+   - MANDATORY: Track and report each stage queue separately:
+       triage_queue_lengths   = []  # samples over time
+       consult_queue_lengths  = []  # samples over time
+       treatment_queue_lengths = [] # samples over time
+   - Report in SIMULATION_RESULTS_JSON:
+       "queue_lengths": {{
+           "triage":    {{"mean": ..., "p95": ..., "max": ..., "time_positive_pct": ...}},
+           "consult":   {{"mean": ..., "p95": ..., "max": ..., "time_positive_pct": ...}},
+           "treatment": {{"mean": ..., "p95": ..., "max": ..., "time_positive_pct": ...}},
+           "total":     {{"mean": ..., "p95": ..., "max": ...}}
+       }}
+   - This allows the report to legitimately say "congestion was primarily in the doctor consultation queue" based on data.
+
+10. BLOCKING vs UTILIZATION (DO NOT CONFLATE):
+    - FORBIDDEN: Defining "resource blocked" as `utilization >= 0.99`.
+      * Utilization = fraction of time resource was busy.
+      * Blocking = a patient was unable to enter service because all servers were occupied (queue formed).
+    - CORRECT blocking measurement:
+        # At each event, check whether a patient arrived for a stage but had to wait:
+        doctor_blocked_time_minutes = 0.0    # cumulative time doctor queue had >= 1 patient waiting
+        bed_blocked_time_minutes    = 0.0    # cumulative time bed queue had >= 1 patient waiting
+        nurse_blocked_time_minutes  = 0.0    # cumulative time triage queue had >= 1 patient waiting
+        # Or count per-patient blocking events:
+        patients_who_waited_for_doctor += 1 if patient.consult_queue_wait > 0 else 0
+    - Report:
+        "blocking": {{
+            "pct_patients_waited_for_doctor": float(...),  # % who queued at consultation
+            "pct_patients_waited_for_bed":    float(...),  # % who queued at treatment
+            "pct_patients_waited_for_triage": float(...),  # % who queued at triage
+            "mean_consult_queue_when_positive": float(...)  # conditional mean given queue > 0
+        }}
+    - Never label a utilization threshold check as "constraint blocking."
+
+11. FIXED HOURLY SNAPSHOTS (NOT EVENT-TRIGGERED SNAPSHOTS):
+    - FORBIDDEN: Taking a snapshot when `current_time >= last_snapshot + 60.0` inside the event loop.
+      * This produces event-triggered snapshots at irregular intervals (e.g. t=62, t=124) not hourly.
+      * Periods with no events produce missing hours.
+    - CORRECT approach: Pre-define fixed observation times and query system state at each:
+        observation_times = list(range(0, T_horizon + 1, 60))  # [0, 60, 120, ..., 1440]
+        snapshots = []
+        obs_idx = 0
+        # During event processing, whenever current_time > observation_times[obs_idx]:
+        while obs_idx < len(observation_times) and current_time >= observation_times[obs_idx]:
+            snapshots.append({{
+                "time_min": observation_times[obs_idx],
+                "triage_queue": len(triage_queue),
+                "consult_queue": len(consult_queue),
+                "treatment_queue": len(treatment_queue),
+                "doctors_busy": INITIAL_DOCTORS - available_doctors,
+                "beds_busy":    INITIAL_BEDS - available_beds
+            }})
+            obs_idx += 1
+    - Report time-series snapshots at exactly t=0, 60, 120, ..., 1440.
+
+12. HORIZON/CLEARANCE SEPARATION & WORKLOAD/CAPACITY AUDIT:
+    - MANDATORY: Snapshot system state at EXACTLY t = T_horizon (e.g. 1440 minutes):
+        snapshot_at_horizon = {{
+            "time_min": T_horizon,
+            "patients_completed": len(completed_patients),
+            "patients_in_triage":    (triage queue + active triage),
+            "patients_in_consult":   (consult queue + active consult),
+            "patients_in_treatment": (treatment queue + active treatment),
+            "total_remaining_in_system": X
+        }}
+    - If simulation drains past T_horizon, measure clearance time:
+        clearance_time_minutes = time_of_last_discharge - T_horizon
+    - Report in summary:
+        "horizon_state": {{
+            "patients_remaining_at_24h": int(...),
+            "patients_completed_within_24h": int(...),
+            "clearance_time_minutes": float(...)  # time after 24h until system empty
+        }}
+    - MANDATORY pre-simulation workload audit: compute expected utilization at design capacity before running.
+      Include in SIMULATION_RESULTS_JSON under "workload_audit":
+        expected_arrivals_per_hour     = sum(hourly_rates) / 24.0
+        doctor_throughput_per_hour     = INITIAL_DOCTORS * 60.0 / mean_consult_minutes
+        nurse_throughput_per_hour      = INITIAL_NURSES  * 60.0 / mean_triage_minutes
+        bed_throughput_per_hour        = INITIAL_BEDS    * 60.0 / mean_treatment_minutes
+        doctor_load_ratio  = expected_arrivals_per_hour / doctor_throughput_per_hour
+        nurse_load_ratio   = expected_arrivals_per_hour / nurse_throughput_per_hour
+        bed_load_ratio     = expected_arrivals_per_hour / bed_throughput_per_hour
+      If any load_ratio > 1.0, the stage is structurally overloaded and the report MUST declare this upfront.
+      This workload audit validates whether simulation outcomes (large queues) are consistent with capacity arithmetic.
+
+═══════════════════════════════════════════════════
 PART 11 — MULTI-BRANCH CAUSAL MODELING (HYPOTHESIS MODE ONLY)
 ═══════════════════════════════════════════════════
 
@@ -1687,6 +1925,23 @@ Review the code against ALL of the following criteria:
         }}
     - FLAG WARNING: if P_MODEL_PHYSICAL_ACCESS is evaluated with random rolls when H3 is deterministically blocked.
     - FLAG WARNING: if the code does not distinguish Bayesian posterior (e.g. 1.23%) from simulation eligibility (0%).
+
+16. RNG_ISOLATION_AND_PROPAGATION
+    - Does every stochastic draw come strictly from the single seeded `rng = np.random.default_rng(seed)` instance passed to classes and functions?
+    - FLAG CRITICAL: if any class (e.g. Patient, Server, Agent), constructor, or function creates an unseeded `np.random.default_rng()` or calls `np.random.seed()` inside loops.
+    - FLAG CRITICAL: if unseeded global `np.random.*` calls are used anywhere in the simulation logic.
+
+17. DISCRETE_EVENT_SIMULATION_FIDELITY
+    - If the methodology is declared as `discrete_event_simulation`, does it use a true continuous-time next-event scheduler (`heapq` or `simpy`)?
+    - FLAG CRITICAL: if the code claims "discrete_event_simulation" but is actually a 1-minute fixed-step discrete loop (`for minute in range(...)`) with continuous service durations rounded to minute intervals.
+
+18. FINITE_HORIZON_CENSORING_AND_WIP
+    - In finite-horizon queueing/service systems, does the code properly handle entities remaining in the system at the horizon boundary?
+    - FLAG CRITICAL: if waiting times are computed ONLY over discharged/completed entities while heavily congested queues still contain unserved entities at cutoff (survivor bias), without reporting remaining WIP and right-censoring.
+
+19. CONSTRAINT_BLOCKING_INSTRUMENTATION
+    - Are constraint-blocked flags and duration metrics genuinely measured by the simulation runtime?
+    - FLAG CRITICAL: if constraint application flags or blocking metrics are dummy hardcoded lists (e.g. `[0] * NUM_RUNS`). The code must actively count events/minutes where queues were non-empty while resources were 0.
     - ACCEPTABLE: a branch that does NOT require physical access (remote credential
       theft) is not constrained by a physical alibi.
 
@@ -1813,6 +2068,118 @@ Review the code against ALL of the following criteria:
     - Does the code use a clean, modern RNG architecture (`rng = np.random.default_rng(seed)`) passed explicitly?
     - FLAG WARNING if `import random` is used alongside NumPy or if global `np.random.seed` is called inside trial loops.
     - FLAG CRITICAL if typos in percentage scaling (such as `prob * 100.1` instead of `prob * 100.0`) are found.
+
+38. RESOURCE_UTILIZATION_INVARIANT (Multi-Resource Queueing Systems)
+    - Utilization of any finite-capacity resource must be bounded in [0, 1].
+    - FLAG CRITICAL if any utilization metric (doctor_utilization, nurse_utilization, bed_utilization) in the JSON outcomes exceeds 1.0 or is negative. These are physically impossible values regardless of implementation.
+    - FLAG CRITICAL if the distribution arrays for utilization contain values > 1.0 or < 0.0 across replications.
+    - Example: a doctor_utilization mean of 6.66 or a bed_utilization max of 1.21 MUST be flagged as a critical measurement error, not a modelling result.
+
+39. MEASUREMENT_WINDOW_INVARIANT (Post-Horizon Drain Contamination)
+    - If the simulation has a defined performance horizon (e.g. T_horizon = 1440 min) and continues processing patients after T_horizon to drain the system:
+    - FLAG CRITICAL if resource_busy_minutes (doctor, nurse, bed) accumulates BEYOND T_horizon while the utilization denominator remains `T_horizon × capacity`.
+    - The correct implementation: `dt_for_util = max(0.0, min(current_time, T_horizon) - max(last_time, 0.0))` so drain-period occupancy is excluded from the performance-window numerator.
+    - FLAG CRITICAL if utilization is computed as `total_busy_minutes / (T_horizon * capacity)` but events run past T_horizon without clipping the numerator.
+    - FLAG WARNING if the simulation does not separate the arrival window from the drain window in comments or logic.
+
+40. RESOURCE_ROLE_CONSISTENCY (Multi-Stage Service Systems)
+    - Every patient/entity processing stage must declare exactly which resources it consumes.
+    - FLAG CRITICAL if a doctor is consumed (decremented and held) during the treatment stage when the scenario description does NOT explicitly state that a doctor must remain present during treatment. The default treatment resource is a bed only.
+    - FLAG CRITICAL if nurses are listed in the scenario resource specification (e.g. "3 nurses") but the code never decrements or manages nurse availability — nurses must be actively tracked if they are a named resource.
+    - FLAG CRITICAL if any resource availability counter can go negative (available_doctors < 0, available_nurses < 0, available_beds < 0).
+    - FLAG WARNING if a resource-role assumption (e.g. doctor during treatment) is present in the code but not declared in the SIMULATION_RESULTS_JSON parameters with a provenance label.
+
+41. METRIC_SEMANTIC_VALIDATION (Wait-Time Label Accuracy)
+    - FLAG CRITICAL if a metric computed as `consultation_start_time - arrival_time` is reported as "mean patient waiting time", "average wait", or "patient wait" without specifying that it measures the pre-consultation delay only (triage queue + triage + consultation queue).
+    - The correct label must be: "mean arrival-to-consultation wait" or "mean pre-consultation delay" or equivalent.
+    - FLAG CRITICAL if a ">30 min" threshold metric is reported without specifying which stage boundary it applies to (e.g. "% with arrival-to-consultation wait > 30 min", NOT just "% waiting > 30 min").
+    - FLAG WARNING if the multi-stage wait decomposition (triage queue wait, consult queue wait, treatment queue wait, total LOS) is absent from the JSON outcomes.
+
+42. EXPERIMENT_EVIDENCE_VALIDATION (No Fabricated Sensitivity Claims)
+    - FLAG CRITICAL if the simulation JSON contains `"scenario_comparison": {{}}` (empty dict) but the simulation code or report narrative claims a sensitivity sweep, CRN comparison, or parameter scaling analysis was performed.
+    - FLAG CRITICAL if the report states results such as "under Common Random Numbers, metrics scale monotonically with arrival rates" when no sensitivity loop exists in the generated code.
+    - The report must only claim experimental findings that are backed by code actually executed in this simulation run. Theoretical expectations must be clearly labeled as such, not as simulation results.
+    - If no sensitivity experiment was run, the report must state explicitly: "Sensitivity analysis was not executed in this simulation run."
+
+43. PHYSICAL_INVARIANT_VALIDATION (Runtime Correctness Guards)
+    - FLAG CRITICAL if physical invariant assertions are absent from the code at the end of each replication:
+        assert available_doctors >= 0
+        assert available_nurses  >= 0
+        assert available_beds    >= 0
+        assert len(completed_patients) <= total_arrivals
+    - FLAG CRITICAL if any replication produces `completed_patients > total_arrivals`.
+    - FLAG CRITICAL if any replication produces `available_doctors > INITIAL_DOCTORS` or `available_beds > INITIAL_BEDS` (resource counter exceeded initial capacity — double-release bug).
+    - FLAG WARNING if the simulation continues past T_horizon to drain patients but does not track how many patients were in-progress at T_horizon (end-of-horizon backlog).
+
+44. LOGNORMAL_MEAN_PARAMETERIZATION (Service Time Distribution)
+    - FLAG CRITICAL if `mu = math.log(target_mean)` is used as the log-normal mu parameter.
+      The correct formula to achieve an arithmetic mean of `target_mean` is:
+          mu = math.log(target_mean) - (sigma ** 2) / 2.0
+      Using `math.log(target_mean)` directly inflates the mean by `exp(sigma^2/2)`.
+      Example: sigma=0.4, target_mean=5.0 → actual mean = 5.42 min (8.4% overrun).
+               sigma=0.5, target_mean=15.0 → actual mean = 16.92 min (12.8% overrun).
+               sigma=0.8, target_mean=45.0 → actual mean = 59.26 min (31.7% overrun).
+    - FLAG CRITICAL if triage, consultation, or treatment service times are parameterized with the wrong mu.
+    - The parameters table in SIMULATION_RESULTS_JSON must show both `target_mean` and the `mu_used` value.
+
+45. SPLIT_QUEUE_INSTRUMENTATION (Per-Stage Queue Tracking)
+    - FLAG CRITICAL if only a single aggregate queue length is tracked/reported (`total_queue = triage + consult + treatment`).
+    - MANDATORY: Each stage's queue must be tracked and reported separately:
+        "queue_lengths": {{
+            "triage":    {{"mean": ..., "p95": ..., "max": ..., "time_positive_pct": ...}},
+            "consult":   {{"mean": ..., "p95": ..., "max": ..., "time_positive_pct": ...}},
+            "treatment": {{"mean": ..., "p95": ..., "max": ..., "time_positive_pct": ...}},
+            "total":     {{"mean": ..., "p95": ..., "max": ...}}
+        }}
+    - FLAG WARNING if the report claims "congestion was primarily in the doctor queue" without per-stage queue data to support that conclusion.
+
+46. BLOCKING_VS_UTILIZATION (Resource Constraint Measurement)
+    - FLAG CRITICAL if "resource was blocked" or "capacity constraint active" is defined as `utilization >= 0.99`.
+      Utilization (fraction of time a resource is busy) is NOT the same as patient blocking (a patient had to wait because all resources were occupied).
+    - CORRECT blocking metrics:
+        * `pct_patients_waited_for_doctor`: fraction of patients whose consult_queue_wait > 0
+        * `pct_patients_waited_for_bed`: fraction of patients whose treatment_queue_wait > 0
+        * `doctor_queue_positive_pct`: fraction of simulation time that at least 1 patient was queued for a doctor
+        * `mean_consult_queue_when_positive`: mean consult queue length, conditional on queue > 0
+    - FLAG CRITICAL if the constraint table claims blocking percentage from a utilization flag.
+
+47. FIXED_SNAPSHOT_MECHANISM (Hourly State Observations)
+    - FLAG CRITICAL if time-series snapshots are generated inside the event loop when `current_time >= last_snapshot + 60`.
+      This produces event-triggered snapshots at IRREGULAR times, not fixed hourly observations. Long event-free periods produce missing hours.
+    - CORRECT: Pre-define `observation_times = [0, 60, 120, ..., 1440]` and check before processing each event:
+        while obs_idx < len(observation_times) and current_time >= observation_times[obs_idx]:
+            record_snapshot(observation_times[obs_idx])
+            obs_idx += 1
+    - This guarantees exactly 25 snapshots (t=0..1440) at fixed intervals, usable for time-series analysis.
+    - FLAG WARNING if the number of recorded time-series snapshots per replication is not equal to `(T_horizon // snapshot_interval) + 1`.
+
+48. HORIZON_CLEARANCE_SEPARATION (24h State + Clearance Metrics)
+    - FLAG CRITICAL if the simulation captures patient-level outcomes (completion times, waiting times) from both inside [0, T_horizon] AND outside [T_horizon, clearance] without clearly separating the two populations.
+    - MANDATORY: Record system state at EXACTLY t = T_horizon:
+        "horizon_state": {{
+            "time_min": T_horizon,
+            "patients_completed_within_horizon": int(...),
+            "patients_remaining_in_system": int(...),
+            "breakdown": {{"in_triage": int, "in_consult": int, "in_treatment": int,
+                          "triage_queue": int, "consult_queue": int, "treatment_queue": int}}
+        }}
+    - If post-horizon drain is used, measure and report `clearance_time_minutes = final_discharge_time - T_horizon`.
+    - FLAG WARNING if waiting times include patients who received service after T_horizon without labeling those outcomes separately.
+    - Report MUST distinguish "24h operational metrics" from "full drain metrics" in section headers.
+
+49. WORKLOAD_CAPACITY_AUDIT (Pre-Simulation Design Validation)
+    - FLAG WARNING if the simulation JSON does not include a pre-simulation workload/capacity audit in `SIMULATION_RESULTS_JSON`.
+    - MANDATORY fields under `"workload_audit"`:
+        expected_arrivals_per_hour  = total_expected_arrivals / (T_horizon_minutes / 60)
+        doctor_capacity_per_hour    = INITIAL_DOCTORS * 60.0 / mean_consult_target_minutes
+        nurse_capacity_per_hour     = INITIAL_NURSES  * 60.0 / mean_triage_target_minutes
+        bed_capacity_per_hour       = INITIAL_BEDS    * 60.0 / mean_treatment_target_minutes
+        doctor_load_ratio  = expected_arrivals_per_hour / doctor_capacity_per_hour
+        nurse_load_ratio   = expected_arrivals_per_hour / nurse_capacity_per_hour
+        bed_load_ratio     = expected_arrivals_per_hour / bed_capacity_per_hour
+    - If doctor_load_ratio > 1.0 or nurse_load_ratio > 1.0 or bed_load_ratio > 1.0:
+        MUST declare in the JSON summary and in the report: "System is structurally overloaded at [STAGE]. Expected arrival rate (X/h) exceeds [STAGE] capacity (Y/h). Queue accumulation is expected."
+    - This audit validates whether large observed queues are consistent with deterministic capacity arithmetic (they should be).
 
 Respond ONLY with a valid JSON object:
 {{
