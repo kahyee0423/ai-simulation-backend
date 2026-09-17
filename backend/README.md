@@ -1,4 +1,4 @@
-# AI Simulation Scientist — Backend Engine 🧬🤖
+# AI Simulation Laboratory (Backend Part) 🧬🤖
 
 The backend engine for the **Universal AI Simulation Laboratory**: an autonomous multi-agent simulation and scientific reasoning platform built with **LangGraph**, **FastAPI**, **Python**, and **LLMs** (Google Gemini via OpenAI-compatible endpoints).
 
