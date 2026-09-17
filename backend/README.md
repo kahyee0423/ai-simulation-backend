@@ -6,6 +6,15 @@ The engine autonomously translates natural language scenario descriptions into r
 
 ---
 
+## Computer Science Classification
+
+- **Autonomous Multi-Agent System (MAS)**: Cyclic state machine built on **LangGraph** orchestrating 8 specialized agent roles with closed-loop self-correction.
+- **Neurosymbolic AI (Hybrid Neural + Symbolic)**: Combines neural language intelligence (Google Gemini) for semantic parsing, planning, and scientific synthesis with deterministic symbolic execution (NumPy, SciPy, SimPy, NetworkX, 10-point mathematical invariant validator).
+- **Automated Scientific Discovery ("In Silico Lab")**: Automates the scientific loop from prior hypotheses $P(H_i)$ to empirical simulation data and posterior belief updates $P(H_i|D)$.
+- **Sandboxed Program Synthesis**: Automated generation and safe subprocess execution of specialized Python simulation scripts.
+
+---
+
 ## Architecture & Multi-Agent Pipeline
 
 The backend execution pipeline is orchestrated as a directed graph in **LangGraph** (`backend/agent/graph.py`), comprising 8 specialized agent and computation nodes:
