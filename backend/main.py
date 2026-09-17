@@ -15,7 +15,9 @@ app = FastAPI(title="AI Simulation API", version="2.2")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://ai-simulation-laboratory.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
