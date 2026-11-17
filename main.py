@@ -1,3 +1,16 @@
+import sys
+import types
+from pathlib import Path
+
+# Ensure root directory is in sys.path and alias 'backend' if running standalone (e.g. Render)
+_root_dir = Path(__file__).resolve().parent
+if str(_root_dir) not in sys.path:
+    sys.path.insert(0, str(_root_dir))
+if "backend" not in sys.modules:
+    _backend_pkg = types.ModuleType("backend")
+    _backend_pkg.__path__ = [str(_root_dir)]
+    sys.modules["backend"] = _backend_pkg
+
 import time
 import re
 from typing import Optional
