@@ -1,7 +1,18 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Search for .env relative to config.py location (backend/.env or root/.env)
+_current_dir = Path(__file__).resolve().parent
+_backend_env = _current_dir / ".env"
+_root_env = _current_dir.parent / ".env"
+
+if _backend_env.exists():
+    load_dotenv(dotenv_path=_backend_env)
+elif _root_env.exists():
+    load_dotenv(dotenv_path=_root_env)
+else:
+    load_dotenv()
 
 
 class Settings:

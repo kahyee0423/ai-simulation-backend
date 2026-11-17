@@ -17,6 +17,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://ai-simulation-laboratory.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -142,6 +145,7 @@ def run_simulation(req: SimulationRequest):
             "statistical_summary": final_state.get("statistical_summary"),
             "report": final_state.get("analysis_report"),
             "language": final_state.get("language") or resolved_language,
+            "chart": final_state.get("chart_image") or "",
         }
     except Exception as e:
         total_time = time.time() - start_time

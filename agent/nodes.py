@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from backend.config import settings
 from backend.agent.state import SimulationState
 from backend.utils.sandbox import execute_python_code
+from backend.utils.chart_generator import generate_scientific_chart
 from backend.utils.logger import (
     log_step_start,
     log_step_progress,
@@ -1012,7 +1013,7 @@ PART 9 — CODE QUALITY REQUIREMENTS
 2. No undefined variables. All variables initialized before use.
 3. Division by zero guards where required.
 4. No impossible states (e.g. negative populations).
-5. No plt.show() — save figures to file or omit plotting.
+5. If visualizing data with matplotlib: do NOT call plt.show(). Instead, save the figure with plt.savefig('simulation_chart.png', dpi=150, bbox_inches='tight') and call plt.close(). If not plotting, omit matplotlib.
 6. Also print human-readable output BEFORE the JSON block.
 7. Libraries available: numpy, scipy, simpy, networkx, matplotlib,
    random, math, pandas, statistics
@@ -2283,7 +2284,7 @@ def executor_node(state: SimulationState) -> SimulationState: #node 4
     log_step_start("EXECUTOR", f"Running simulation code ({num_lines} lines) in sandbox...")
 
     start_time = time.time()
-    stdout, stderr = execute_python_code(code)
+    stdout, stderr, chart_base64 = execute_python_code(code)
     elapsed = time.time() - start_time
 
     structured_results = ""
@@ -2302,6 +2303,15 @@ def executor_node(state: SimulationState) -> SimulationState: #node 4
                 "No SIMULATION_RESULTS_JSON block found — will rely on raw stdout"
             )
 
+    if not chart_base64:
+        log_step_progress("Generating scientific posterior & outcome figure...")
+        chart_base64 = generate_scientific_chart(
+            hypothesis_analysis=state.get("hypothesis_analysis", ""),
+            structured_results=structured_results,
+            statistical_summary="",
+            user_prompt=state.get("user_prompt", "")
+        )
+
     if stderr:
         last_error_line = stderr.strip().splitlines()[-1] if stderr.strip() else "Unknown error"
         log_step_warning("EXECUTOR", f"Script produced errors: {last_error_line}")
@@ -2311,13 +2321,15 @@ def executor_node(state: SimulationState) -> SimulationState: #node 4
             "EXECUTOR",
             elapsed,
             f"Execution completed — {out_lines} stdout lines, "
-            f"structured_results={'yes' if structured_results else 'no'}"
+            f"structured_results={'yes' if structured_results else 'no'}, "
+            f"chart={'yes' if chart_base64 else 'no'}"
         )
 
     return {
         "execution_output": stdout,
         "execution_error": stderr,
         "structured_results": structured_results,
+        "chart_image": chart_base64,
     }
 
 def validator_node(state: SimulationState) -> SimulationState: #node 5
@@ -3137,7 +3149,20 @@ def stats_node(state: SimulationState) -> SimulationState: #node 6
         f"Statistical summary generated ({len(summary_text)} chars, [{target_lang}])"
     )
 
-    return {"statistical_summary": summary_text, "language": target_lang}
+    chart_img = state.get("chart_image", "")
+    if not chart_img:
+        chart_img = generate_scientific_chart(
+            hypothesis_analysis=state.get("hypothesis_analysis", ""),
+            structured_results=structured,
+            statistical_summary=summary_text,
+            user_prompt=state.get("user_prompt", "")
+        )
+
+    return {
+        "statistical_summary": summary_text,
+        "language": target_lang,
+        "chart_image": chart_img
+    }
 
 def analyst_node(state: SimulationState) -> SimulationState: #node 7
     """

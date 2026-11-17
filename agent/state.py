@@ -18,3 +18,4 @@ class SimulationState(TypedDict):
     validation_report: str       # Pure-Python post-execution consistency checks
     statistical_summary: str     # Python-computed statistics (mean, median, percentiles, etc.)
     analysis_report: str         # Final 19-section scientific analysis report
+    chart_image: str             # Base64 data URL for generated scientific chart
